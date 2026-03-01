@@ -1,0 +1,11 @@
+{
+  "pipeline": ["reviewer", "architect", "qa", "coder", "validator"],
+  "defaults": {
+    "model": "sonnet",
+    "max_budget_usd": 5
+  },
+  "stage_overrides": {
+    "architect": { "model": "opus", "max_budget_usd": 3 },
+    "coder": { "max_budget_usd": 10 }
+  }
+}

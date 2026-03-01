@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─── Swarm: Pipeline Orchestrator for Coding Agents ─────────────────────────
+# Runs a sequential pipeline of specialized agent roles through tmux panes.
+# Each stage streams output visibly and passes context via files.
+
+SWARM_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMUX="/opt/homebrew/bin/tmux"
+CLAUDE="/opt/homebrew/bin/claude"
+CONFIG="$SWARM_DIR/swarm.json"
+ROLES_DIR="$SWARM_DIR/roles"
+SESSION_NAME="swarm"
+POLL_INTERVAL=3
+STAGE_TIMEOUT=1800  # 30 minutes default
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+die() { echo -e "${RED}error:${NC} $*" >&2; exit 1; }
+info() { echo -e "${BLUE}swarm:${NC} $*"; }
+success() { echo -e "${GREEN}swarm:${NC} $*"; }
+warn() { echo -e "${YELLOW}swarm:${NC} $*"; }
+
+usage() {
+    cat <<'EOF'
+Usage: swarm <repo_path> <ticket> [options]
+
+Arguments:
+  <repo_path>              Path to the git repository
+  <ticket>                 Inline ticket description (quoted string)
+
+Options:
+  --github-issue ISSUE     Fetch ticket from GitHub (e.g., owner/repo#42)
+  --ticket-file FILE       Read ticket from a file
+  --session NAME           tmux session name (default: swarm)
+  --timeout SECONDS        Per-stage timeout in seconds (default: 1800)
+  --help                   Show this help
+
+Examples:
+  swarm ~/repos/myapp "add a health check endpoint"
+  swarm ~/repos/myapp --github-issue owner/repo#42
+  swarm ~/repos/myapp --ticket-file ticket.md
+EOF
+    exit 0
+}
+
+# ─── Prerequisite Checks ────────────────────────────────────────────────────
+
+check_prerequisites() {
+    local missing=()
+    [[ -x "$TMUX" ]] || missing+=(tmux)
+    command -v jq &>/dev/null || missing+=(jq)
+    [[ -x "$CLAUDE" ]] || missing+=(claude)
+    command -v gh &>/dev/null || missing+=(gh)
+    command -v git &>/dev/null || missing+=(git)
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "missing prerequisites: ${missing[*]}"
+    fi
+}
+
+# ─── Config Helpers ──────────────────────────────────────────────────────────
+
+get_pipeline() {
+    jq -r '.pipeline[]' "$CONFIG"
+}
+
+get_stage_model() {
+    local stage="$1"
+    local override
+    override=$(jq -r --arg s "$stage" '.stage_overrides[$s].model // empty' "$CONFIG")
+    if [[ -n "$override" ]]; then
+        echo "$override"
+    else
+        jq -r '.defaults.model' "$CONFIG"
+    fi
+}
+
+get_stage_budget() {
+    local stage="$1"
+    local override
+    override=$(jq -r --arg s "$stage" '.stage_overrides[$s].max_budget_usd // empty' "$CONFIG")
+    if [[ -n "$override" ]]; then
+        echo "$override"
+    else
+        jq -r '.defaults.max_budget_usd' "$CONFIG"
+    fi
+}
+
+# ─── Argument Parsing ────────────────────────────────────────────────────────
+
+parse_args() {
+    REPO_PATH=""
+    TICKET=""
+    TICKET_SOURCE="inline"
+
+    [[ $# -eq 0 ]] && usage
+    [[ "$1" == "--help" ]] && usage
+
+    # First positional arg is repo_path
+    REPO_PATH="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --github-issue)
+                [[ $# -ge 2 ]] || die "--github-issue requires an argument"
+                TICKET_SOURCE="github"
+                GITHUB_ISSUE="$2"
+                shift 2
+                ;;
+            --ticket-file)
+                [[ $# -ge 2 ]] || die "--ticket-file requires an argument"
+                TICKET_SOURCE="file"
+                TICKET_FILE="$2"
+                shift 2
+                ;;
+            --session)
+                [[ $# -ge 2 ]] || die "--session requires an argument"
+                SESSION_NAME="$2"
+                shift 2
+                ;;
+            --timeout)
+                [[ $# -ge 2 ]] || die "--timeout requires an argument"
+                STAGE_TIMEOUT="$2"
+                shift 2
+                ;;
+            --help)
+                usage
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                # Remaining positional arg is the ticket
+                TICKET="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # Resolve repo path
+    REPO_PATH="$(cd "$REPO_PATH" 2>/dev/null && pwd)" || die "invalid repo path: $REPO_PATH"
+    [[ -d "$REPO_PATH/.git" ]] || die "not a git repository: $REPO_PATH"
+
+    # Resolve ticket content
+    case "$TICKET_SOURCE" in
+        inline)
+            [[ -n "$TICKET" ]] || die "no ticket provided"
+            ;;
+        github)
+            info "fetching GitHub issue $GITHUB_ISSUE..."
+            TICKET=$(gh issue view "$GITHUB_ISSUE" --json title,body --jq '"# " + .title + "\n\n" + .body') \
+                || die "failed to fetch GitHub issue"
+            ;;
+        file)
+            [[ -f "$TICKET_FILE" ]] || die "ticket file not found: $TICKET_FILE"
+            TICKET=$(cat "$TICKET_FILE")
+            ;;
+    esac
+}
+
+# ─── Worktree Setup ─────────────────────────────────────────────────────────
+
+setup_worktree() {
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    BRANCH_NAME="swarm/${timestamp}"
+    WORKTREE_PATH="${REPO_PATH}/../$(basename "$REPO_PATH")-swarm-${timestamp}"
+
+    info "creating worktree at $WORKTREE_PATH (branch: $BRANCH_NAME)"
+    git -C "$REPO_PATH" worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" \
+        || die "failed to create worktree"
+
+    WORKTREE_PATH="$(cd "$WORKTREE_PATH" && pwd)"
+    SWARM_RUNTIME="$WORKTREE_PATH/.swarm"
+    mkdir -p "$SWARM_RUNTIME/prompts" "$SWARM_RUNTIME/log"
+
+    # Write run metadata
+    jq -n \
+        --arg ticket "$TICKET" \
+        --arg branch "$BRANCH_NAME" \
+        --arg worktree "$WORKTREE_PATH" \
+        --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{ticket: $ticket, branch: $branch, worktree: $worktree, started: $started, stages: {}}' \
+        > "$SWARM_RUNTIME/run.json"
+
+    success "worktree ready: $WORKTREE_PATH"
+}
+
+# ─── tmux Setup ──────────────────────────────────────────────────────────────
+
+setup_tmux() {
+    local stages
+    mapfile -t stages < <(get_pipeline)
+
+    # Kill existing session if any
+    "$TMUX" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+    # Create session with first pane
+    "$TMUX" new-session -d -s "$SESSION_NAME" -x 200 -y 50
+
+    # First pane gets labeled
+    "$TMUX" send-keys -t "${SESSION_NAME}:0.0" \
+        "echo '═══ ${stages[0]^^} ═══ [PENDING]'" Enter
+
+    # Create remaining panes
+    for ((i = 1; i < ${#stages[@]}; i++)); do
+        "$TMUX" split-window -t "${SESSION_NAME}:0" -v
+        "$TMUX" send-keys -t "${SESSION_NAME}:0.${i}" \
+            "echo '═══ ${stages[$i]^^} ═══ [PENDING]'" Enter
+    done
+
+    # Even out the layout
+    "$TMUX" select-layout -t "${SESSION_NAME}:0" even-vertical
+
+    # Store pane mapping (stage index → pane index)
+    # Panes are indexed 0..N-1 matching stage order
+    PANE_COUNT=${#stages[@]}
+
+    info "tmux session '$SESSION_NAME' created with $PANE_COUNT panes"
+    info "attach with: tmux attach -t $SESSION_NAME"
+}
+
+# ─── Prompt Builders ─────────────────────────────────────────────────────────
+
+build_prompt_reviewer() {
+    cat <<EOF
+# Ticket
+
+$TICKET
+
+# Instructions
+
+Analyze this ticket and the codebase. Write your analysis to .swarm/review.md following the format in your system prompt.
+EOF
+}
+
+build_prompt_architect() {
+    local review
+    review=$(cat "$SWARM_RUNTIME/review.md" 2>/dev/null || echo "(no review available)")
+
+    cat <<EOF
+# Ticket
+
+$TICKET
+
+# Reviewer's Analysis
+
+$review
+
+# Instructions
+
+Create a detailed implementation plan based on the ticket and review. Write your plan to .swarm/plan.md following the format in your system prompt.
+EOF
+}
+
+build_prompt_qa() {
+    local plan
+    plan=$(cat "$SWARM_RUNTIME/plan.md" 2>/dev/null || echo "(no plan available)")
+
+    cat <<EOF
+# Ticket
+
+$TICKET
+
+# Implementation Plan
+
+$plan
+
+# Instructions
+
+Write tests based on the implementation plan (TDD). Tests should define expected behavior and will initially fail since no production code exists yet. Follow existing project test conventions. Commit your test files when done.
+EOF
+}
+
+build_prompt_coder() {
+    local plan
+    plan=$(cat "$SWARM_RUNTIME/plan.md" 2>/dev/null || echo "(no plan available)")
+
+    cat <<EOF
+# Ticket
+
+$TICKET
+
+# Implementation Plan
+
+$plan
+
+# Instructions
+
+Implement the solution following the plan step by step. Run the existing tests frequently — your goal is to make all tests pass. Follow project conventions. Commit your changes when done.
+EOF
+}
+
+build_prompt_validator() {
+    local review plan
+    review=$(cat "$SWARM_RUNTIME/review.md" 2>/dev/null || echo "(no review available)")
+    plan=$(cat "$SWARM_RUNTIME/plan.md" 2>/dev/null || echo "(no plan available)")
+
+    cat <<EOF
+# Ticket
+
+$TICKET
+
+# Reviewer's Analysis
+
+$review
+
+# Implementation Plan
+
+$plan
+
+# Instructions
+
+Validate the implementation:
+1. Run git diff against the base branch to review all changes
+2. Run the full test suite
+3. Verify the implementation matches the plan
+4. Create a PR using: gh pr create
+   - Title should summarize the change
+   - Description should include: summary, test coverage notes, any caveats
+EOF
+}
+
+build_stage_prompt() {
+    local stage="$1"
+    local prompt_file="$SWARM_RUNTIME/prompts/${stage}.txt"
+
+    case "$stage" in
+        reviewer)  build_prompt_reviewer  > "$prompt_file" ;;
+        architect) build_prompt_architect > "$prompt_file" ;;
+        qa)        build_prompt_qa        > "$prompt_file" ;;
+        coder)     build_prompt_coder     > "$prompt_file" ;;
+        validator) build_prompt_validator > "$prompt_file" ;;
+        *)         die "unknown stage: $stage" ;;
+    esac
+
+    echo "$prompt_file"
+}
+
+# ─── Agent Dispatch ──────────────────────────────────────────────────────────
+
+build_claude_cmd() {
+    local stage="$1"
+    local model budget prompt_file system_prompt log_file exitcode_file
+
+    model=$(get_stage_model "$stage")
+    budget=$(get_stage_budget "$stage")
+    prompt_file="$SWARM_RUNTIME/prompts/${stage}.txt"
+    system_prompt="$ROLES_DIR/${stage}.md"
+    log_file="$SWARM_RUNTIME/log/${stage}.log"
+    exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
+
+    # Build the command that runs in the tmux pane
+    cat <<EOF
+echo '═══ ${stage^^} ═══ [RUNNING]' && \\
+cd ${WORKTREE_PATH} && \\
+${CLAUDE} -p \\
+  --model ${model} \\
+  --max-budget-usd ${budget} \\
+  --dangerously-skip-permissions \\
+  --output-format text \\
+  --system-prompt "\$(cat ${system_prompt})" \\
+  "\$(cat ${prompt_file})" \\
+  2>&1 | tee ${log_file}; \\
+echo \${PIPESTATUS[0]} > ${exitcode_file}
+EOF
+}
+
+# Extensible dispatch — add new agent types here
+build_agent_cmd() {
+    local stage="$1"
+    local agent_type="${2:-claude}"
+
+    case "$agent_type" in
+        claude) build_claude_cmd "$stage" ;;
+        # Future agent types:
+        # codex)  build_codex_cmd "$stage" ;;
+        # kimi)   build_kimi_cmd "$stage" ;;
+        *)      die "unknown agent type: $agent_type" ;;
+    esac
+}
+
+# ─── Stage Runner ────────────────────────────────────────────────────────────
+
+run_stage() {
+    local stage="$1"
+    local pane_index="$2"
+    local exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
+    local start_time elapsed
+
+    # Build prompt file for this stage
+    build_stage_prompt "$stage"
+
+    # Build agent command
+    local cmd
+    cmd=$(build_agent_cmd "$stage")
+
+    # Update run metadata
+    local tmp
+    tmp=$(mktemp)
+    jq --arg s "$stage" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.stages[$s] = {status: "running", started: $t}' \
+        "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+    info "starting stage: ${stage}"
+
+    # Send command to the pane
+    "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" "$cmd" Enter
+
+    # Poll for completion
+    start_time=$(date +%s)
+    while true; do
+        if [[ -f "$exitcode_file" ]]; then
+            local exit_code
+            exit_code=$(cat "$exitcode_file")
+
+            # Update run metadata
+            tmp=$(mktemp)
+            jq --arg s "$stage" --arg c "$exit_code" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.stages[$s].status = (if $c == "0" then "done" else "failed" end) | .stages[$s].exit_code = ($c | tonumber) | .stages[$s].finished = $t' \
+                "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+            if [[ "$exit_code" == "0" ]]; then
+                # Update pane header
+                "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                    "echo '═══ ${stage^^} ═══ [DONE]'" Enter
+                success "stage ${stage} completed successfully"
+                return 0
+            else
+                "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                    "echo '═══ ${stage^^} ═══ [FAILED] (exit code: ${exit_code})'" Enter
+                warn "stage ${stage} failed with exit code ${exit_code}"
+                return 1
+            fi
+        fi
+
+        # Check timeout
+        elapsed=$(( $(date +%s) - start_time ))
+        if [[ $elapsed -ge $STAGE_TIMEOUT ]]; then
+            "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                "echo '═══ ${stage^^} ═══ [TIMEOUT]'" Enter
+
+            tmp=$(mktemp)
+            jq --arg s "$stage" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.stages[$s].status = "timeout" | .stages[$s].finished = $t' \
+                "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+            warn "stage ${stage} timed out after ${STAGE_TIMEOUT}s"
+            return 1
+        fi
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+# ─── Pipeline Loop ───────────────────────────────────────────────────────────
+
+run_pipeline() {
+    local stages
+    mapfile -t stages < <(get_pipeline)
+
+    info "pipeline: ${stages[*]}"
+    info "ticket: $(echo "$TICKET" | head -c 80)..."
+
+    for ((i = 0; i < ${#stages[@]}; i++)); do
+        local stage="${stages[$i]}"
+
+        if ! run_stage "$stage" "$i"; then
+            echo
+            warn "pipeline halted at stage: ${stage}"
+            warn "worktree preserved at: $WORKTREE_PATH"
+            warn "logs: $SWARM_RUNTIME/log/"
+            warn "attach: tmux attach -t $SESSION_NAME"
+            exit 1
+        fi
+    done
+
+    echo
+    success "pipeline completed successfully!"
+    success "worktree: $WORKTREE_PATH"
+    success "branch: $BRANCH_NAME"
+    info "attach to review: tmux attach -t $SESSION_NAME"
+}
+
+# ─── Cleanup ─────────────────────────────────────────────────────────────────
+
+cleanup() {
+    # On interrupt, update run metadata but preserve worktree
+    if [[ -f "$SWARM_RUNTIME/run.json" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.interrupted = $t' \
+            "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+    fi
+    warn "interrupted — worktree preserved at: ${WORKTREE_PATH:-unknown}"
+    exit 130
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+    check_prerequisites
+    parse_args "$@"
+    setup_worktree
+    setup_tmux
+
+    trap cleanup INT TERM
+
+    run_pipeline
+}
+
+main "$@"
