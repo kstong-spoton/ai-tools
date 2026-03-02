@@ -40,26 +40,29 @@ warn() { echo -e "${YELLOW}swarm:${NC} $*"; }
 
 usage() {
     cat <<'EOF'
-Usage: swarm <repo_path> <ticket> [options]
-       swarm <repo_path> --resume <worktree_path>
-
-Arguments:
-  <repo_path>              Path to the git repository
-  <ticket>                 Inline ticket description (quoted string)
+Usage: swarm --repo <path> --ticket <description|url|file>
+       swarm --repo <path> --resume <worktree_path>
 
 Options:
-  --github-issue ISSUE     Fetch ticket from GitHub (e.g., owner/repo#42)
-  --ticket-file FILE       Read ticket from a file
+  --repo PATH              Path to the git repository (relative or absolute)
+  --ticket TICKET          Ticket: description string, GitHub issue URL/ref, or file path
   --resume WORKTREE_PATH   Resume a previously interrupted pipeline
   --session NAME           tmux session name (default: swarm)
   --timeout SECONDS        Per-stage timeout in seconds (default: 1800)
   --help                   Show this help
 
+The --ticket flag auto-detects the input type:
+  - GitHub URL:   https://github.com/owner/repo/issues/42
+  - GitHub ref:   owner/repo#42
+  - File path:    ./ticket.md or /path/to/ticket.md (must exist on disk)
+  - Description:  anything else is treated as an inline ticket
+
 Examples:
-  swarm ~/repos/myapp "add a health check endpoint"
-  swarm ~/repos/myapp --github-issue owner/repo#42
-  swarm ~/repos/myapp --ticket-file ticket.md
-  swarm ~/repos/myapp --resume ~/repos/myapp-swarm-20250101-120000
+  swarm --repo ../myapp --ticket "add a health check endpoint"
+  swarm --repo ../myapp --ticket owner/repo#42
+  swarm --repo ../myapp --ticket https://github.com/owner/repo/issues/42
+  swarm --repo ../myapp --ticket ./ticket.md
+  swarm --repo ../myapp --resume ../myapp-swarm-20250101-120000
 EOF
     exit 0
 }
@@ -139,27 +142,21 @@ get_max_cross_stage_retries() {
 parse_args() {
     REPO_PATH=""
     TICKET=""
-    TICKET_SOURCE="inline"
+    local ticket_raw=""
 
     [[ $# -eq 0 ]] && usage
     [[ "$1" == "--help" ]] && usage
 
-    # First positional arg is repo_path
-    REPO_PATH="$1"
-    shift
-
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --github-issue)
-                [[ $# -ge 2 ]] || die "--github-issue requires an argument"
-                TICKET_SOURCE="github"
-                GITHUB_ISSUE="$2"
+            --repo)
+                [[ $# -ge 2 ]] || die "--repo requires a path"
+                REPO_PATH="$2"
                 shift 2
                 ;;
-            --ticket-file)
-                [[ $# -ge 2 ]] || die "--ticket-file requires an argument"
-                TICKET_SOURCE="file"
-                TICKET_FILE="$2"
+            --ticket)
+                [[ $# -ge 2 ]] || die "--ticket requires a value"
+                ticket_raw="$2"
                 shift 2
                 ;;
             --resume)
@@ -184,14 +181,21 @@ parse_args() {
                 die "unknown option: $1"
                 ;;
             *)
-                # Remaining positional arg is the ticket
-                TICKET="$1"
+                # Legacy positional args: first is repo, second is ticket
+                if [[ -z "$REPO_PATH" ]]; then
+                    REPO_PATH="$1"
+                elif [[ -z "$ticket_raw" ]]; then
+                    ticket_raw="$1"
+                else
+                    die "unexpected argument: $1"
+                fi
                 shift
                 ;;
         esac
     done
 
     # Resolve repo path
+    [[ -n "$REPO_PATH" ]] || die "no repo path provided (use --repo)"
     REPO_PATH="$(cd "$REPO_PATH" 2>/dev/null && pwd)" || die "invalid repo path: $REPO_PATH"
     [[ -d "$REPO_PATH/.git" ]] || die "not a git repository: $REPO_PATH"
 
@@ -200,21 +204,32 @@ parse_args() {
         return
     fi
 
-    # Resolve ticket content
-    case "$TICKET_SOURCE" in
-        inline)
-            [[ -n "$TICKET" ]] || die "no ticket provided"
-            ;;
-        github)
-            info "fetching GitHub issue $GITHUB_ISSUE..."
-            TICKET=$(gh issue view "$GITHUB_ISSUE" --json title,body --jq '"# " + .title + "\n\n" + .body') \
-                || die "failed to fetch GitHub issue"
-            ;;
-        file)
-            [[ -f "$TICKET_FILE" ]] || die "ticket file not found: $TICKET_FILE"
-            TICKET=$(cat "$TICKET_FILE")
-            ;;
-    esac
+    # Smart ticket resolution: auto-detect type from the raw input
+    [[ -n "$ticket_raw" ]] || die "no ticket provided (use --ticket)"
+
+    if [[ "$ticket_raw" =~ ^https://github\.com/([^/]+/[^/]+)/issues/([0-9]+) ]]; then
+        # GitHub issue URL → fetch via gh
+        local gh_ref="${BASH_REMATCH[1]}#${BASH_REMATCH[2]}"
+        info "fetching GitHub issue ${gh_ref}..."
+        TICKET=$(gh issue view "$gh_ref" --json title,body --jq '"# " + .title + "\n\n" + .body') \
+            || die "failed to fetch GitHub issue: $gh_ref"
+
+    elif [[ "$ticket_raw" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]]; then
+        # GitHub issue ref (owner/repo#42) → fetch via gh
+        info "fetching GitHub issue ${ticket_raw}..."
+        TICKET=$(gh issue view "$ticket_raw" --json title,body --jq '"# " + .title + "\n\n" + .body') \
+            || die "failed to fetch GitHub issue: $ticket_raw"
+
+    elif [[ -f "$ticket_raw" ]]; then
+        # Existing file path → read contents
+        info "reading ticket from file: ${ticket_raw}"
+        TICKET=$(cat "$ticket_raw")
+        [[ -n "$TICKET" ]] || die "ticket file is empty: $ticket_raw"
+
+    else
+        # Plain text description
+        TICKET="$ticket_raw"
+    fi
 }
 
 # ─── Worktree Setup ─────────────────────────────────────────────────────────
