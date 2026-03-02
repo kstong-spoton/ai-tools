@@ -6,7 +6,7 @@ set -euo pipefail
 # Each stage streams output visibly and passes context via files.
 
 SWARM_DIR="$(cd "$(dirname "$0")" && pwd)"
-TMUX="/opt/homebrew/bin/tmux"
+TMUX_BIN="/opt/homebrew/bin/tmux"
 CLAUDE="/opt/homebrew/bin/claude"
 CONFIG="$SWARM_DIR/swarm.json"
 ROLES_DIR="$SWARM_DIR/roles"
@@ -37,6 +37,7 @@ die() { echo -e "${RED}error:${NC} $*" >&2; exit 1; }
 info() { echo -e "${BLUE}swarm:${NC} $*"; }
 success() { echo -e "${GREEN}swarm:${NC} $*"; }
 warn() { echo -e "${YELLOW}swarm:${NC} $*"; }
+
 
 usage() {
     cat <<'EOF'
@@ -71,7 +72,7 @@ EOF
 
 check_prerequisites() {
     local missing=()
-    [[ -x "$TMUX" ]] || missing+=(tmux)
+    [[ -x "$TMUX_BIN" ]] || missing+=(tmux)
     command -v jq &>/dev/null || missing+=(jq)
     [[ -x "$CLAUDE" ]] || missing+=(claude)
     command -v gh &>/dev/null || missing+=(gh)
@@ -266,29 +267,30 @@ setup_worktree() {
 
 setup_tmux() {
     local stages
-    mapfile -t stages < <(get_pipeline)
+    stages=()
+    while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
 
     # Kill existing session if any
-    "$TMUX" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+    "$TMUX_BIN" kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
     # Create session with first pane
-    "$TMUX" new-session -d -s "$SESSION_NAME" -x 200 -y 50
+    "$TMUX_BIN" new-session -d -s "$SESSION_NAME" -x 200 -y 50
 
     # First pane gets labeled
-    "$TMUX" select-pane -t "${SESSION_NAME}:0.0" -T "${stages[0]^^}"
-    "$TMUX" send-keys -t "${SESSION_NAME}:0.0" \
+    "$TMUX_BIN" select-pane -t "${SESSION_NAME}:0.0" -T "${stages[0]^^}"
+    "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.0" \
         "echo '═══ ${stages[0]^^} ═══ [PENDING]'" Enter
 
     # Create remaining panes
     for ((i = 1; i < ${#stages[@]}; i++)); do
-        "$TMUX" split-window -t "${SESSION_NAME}:0" -v
-        "$TMUX" select-pane -t "${SESSION_NAME}:0.${i}" -T "${stages[$i]^^}"
-        "$TMUX" send-keys -t "${SESSION_NAME}:0.${i}" \
+        "$TMUX_BIN" split-window -t "${SESSION_NAME}:0" -v
+        "$TMUX_BIN" select-pane -t "${SESSION_NAME}:0.${i}" -T "${stages[$i]^^}"
+        "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${i}" \
             "echo '═══ ${stages[$i]^^} ═══ [PENDING]'" Enter
     done
 
     # Even out the layout
-    "$TMUX" select-layout -t "${SESSION_NAME}:0" even-vertical
+    "$TMUX_BIN" select-layout -t "${SESSION_NAME}:0" even-vertical
 
     # Store pane mapping (stage index → pane index)
     # Panes are indexed 0..N-1 matching stage order
@@ -553,7 +555,7 @@ run_stage() {
     info "starting stage: ${stage}"
 
     # Send command to the pane
-    "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" "$cmd" Enter
+    "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${pane_index}" "$cmd" Enter
 
     # Poll for completion
     start_time=$(date +%s)
@@ -570,7 +572,7 @@ run_stage() {
                         '.stages[$s].status = "validation_failed" | .stages[$s].finished = $t | .stages[$s].exit_code = 0' \
                         "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
-                    "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                    "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
                         "echo '═══ ${stage^^} ═══ [VALIDATION FAILED]'" Enter
                     return 1
                 fi
@@ -581,7 +583,7 @@ run_stage() {
                     '.stages[$s].status = "done" | .stages[$s].exit_code = ($c | tonumber) | .stages[$s].finished = $t' \
                     "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
-                "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
                     "echo '═══ ${stage^^} ═══ [DONE]'" Enter
                 success "stage ${stage} completed successfully"
                 return 0
@@ -592,7 +594,7 @@ run_stage() {
                     '.stages[$s].status = "failed" | .stages[$s].exit_code = ($c | tonumber) | .stages[$s].finished = $t' \
                     "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
-                "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
                     "echo '═══ ${stage^^} ═══ [FAILED] (exit code: ${exit_code})'" Enter
                 warn "stage ${stage} failed with exit code ${exit_code}"
                 return 1
@@ -602,7 +604,7 @@ run_stage() {
         # Check timeout
         elapsed=$(( $(date +%s) - start_time ))
         if [[ $elapsed -ge $STAGE_TIMEOUT ]]; then
-            "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+            "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
                 "echo '═══ ${stage^^} ═══ [TIMEOUT]'" Enter
 
             tmp=$(mktemp)
@@ -659,13 +661,14 @@ restore_from_checkpoint() {
 
 setup_tmux_for_resume() {
     local stages
-    mapfile -t stages < <(get_pipeline)
+    stages=()
+    while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
     local expected_panes=${#stages[@]}
 
     # Check if existing session has the right number of panes
     local existing_panes=0
-    if "$TMUX" has-session -t "$SESSION_NAME" 2>/dev/null; then
-        existing_panes=$("$TMUX" list-panes -t "${SESSION_NAME}:0" -F '#{pane_index}' 2>/dev/null | wc -l | tr -d ' ')
+    if "$TMUX_BIN" has-session -t "$SESSION_NAME" 2>/dev/null; then
+        existing_panes=$("$TMUX_BIN" list-panes -t "${SESSION_NAME}:0" -F '#{pane_index}' 2>/dev/null | wc -l | tr -d ' ')
     fi
 
     if [[ "$existing_panes" -eq "$expected_panes" ]]; then
@@ -679,7 +682,8 @@ setup_tmux_for_resume() {
 
 run_pipeline_resume() {
     local stages
-    mapfile -t stages < <(get_pipeline)
+    stages=()
+    while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
 
     info "resuming pipeline: ${stages[*]}"
     info "ticket: $(echo "$TICKET" | head -c 80)..."
@@ -694,7 +698,7 @@ run_pipeline_resume() {
 
         if [[ "$stage_status" == "done" ]]; then
             info "skipping completed stage: ${stage}"
-            "$TMUX" send-keys -t "${SESSION_NAME}:0.${i}" \
+            "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${i}" \
                 "echo '═══ ${stage^^} ═══ [DONE] (resumed)'" Enter
             i=$((i + 1))
             continue
@@ -747,7 +751,8 @@ run_stage_with_retries() {
 
     # Load backoff values from config
     local backoffs
-    mapfile -t backoffs < <(get_retry_backoffs)
+    backoffs=()
+    while IFS= read -r line; do backoffs+=("$line"); done < <(get_retry_backoffs)
 
     local attempt=0
     while true; do
@@ -785,7 +790,7 @@ run_stage_with_retries() {
 
         # Show countdown in tmux pane
         warn "stage ${stage} failed (attempt ${attempt}/${max_retries}) — retrying in ${backoff}s"
-        "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+        "$TMUX_BIN" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
             "echo '═══ ${stage^^} ═══ [RETRY ${attempt}/${max_retries}] waiting ${backoff}s...'" Enter
 
         sleep "$backoff"
@@ -933,7 +938,8 @@ check_verdict() {
 
 run_pipeline() {
     local stages
-    mapfile -t stages < <(get_pipeline)
+    stages=()
+    while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
 
     info "pipeline: ${stages[*]}"
     info "ticket: $(echo "$TICKET" | head -c 80)..."
@@ -983,6 +989,57 @@ run_pipeline() {
     info "attach to review: tmux attach -t $SESSION_NAME"
 }
 
+# ─── Auto-Attach Viewer ───────────────────────────────────────────────────────
+
+open_tmux_viewer() {
+    local attach_cmd="$TMUX_BIN attach -t $SESSION_NAME"
+
+    # Detect terminal and open new tab with tmux attach
+    if [[ "$TERM_PROGRAM" == "ghostty" ]]; then
+        # Ghostty: use AppleScript to open new tab and run command
+        osascript &>/dev/null <<EOF
+tell application "Ghostty"
+    activate
+    tell application "System Events"
+        keystroke "t" using command down
+        delay 0.3
+        keystroke "$attach_cmd"
+        key code 36
+    end tell
+end tell
+EOF
+        info "opened Ghostty tab with tmux viewer"
+    elif [[ "$TERM_PROGRAM" == "iTerm.app" ]]; then
+        # iTerm2: use AppleScript for reliable new tab
+        osascript &>/dev/null <<EOF
+tell application "iTerm"
+    tell current window
+        create tab with default profile
+        tell current session
+            write text "$attach_cmd"
+        end tell
+    end tell
+end tell
+EOF
+        info "opened iTerm2 tab with tmux viewer"
+    elif [[ "$TERM_PROGRAM" == "Apple_Terminal" ]] || [[ -z "$TERM_PROGRAM" ]]; then
+        # Terminal.app or unknown: use Terminal AppleScript
+        osascript &>/dev/null <<EOF
+tell application "Terminal"
+    activate
+    tell application "System Events" to keystroke "t" using command down
+    delay 0.3
+    do script "$attach_cmd" in front window
+end tell
+EOF
+        info "opened Terminal tab with tmux viewer"
+    else
+        # Fallback: just print instructions
+        info "attach with: tmux attach -t $SESSION_NAME"
+        return
+    fi
+}
+
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 cleanup() {
@@ -1012,10 +1069,12 @@ main() {
     if [[ -n "$RESUME_PATH" ]]; then
         restore_from_checkpoint "$RESUME_PATH"
         setup_tmux_for_resume
+        open_tmux_viewer
         run_pipeline_resume
     else
         setup_worktree
         setup_tmux
+        open_tmux_viewer
         run_pipeline
     fi
 }
