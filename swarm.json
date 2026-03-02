@@ -2,7 +2,10 @@
   "pipeline": ["reviewer", "architect", "qa", "coder", "validator"],
   "defaults": {
     "model": "sonnet",
-    "max_budget_usd": 5
+    "max_budget_usd": 5,
+    "max_retries": 3,
+    "retry_backoffs": [10, 30, 60],
+    "max_cross_stage_retries": 3
   },
   "stage_overrides": {
     "architect": { "model": "opus", "max_budget_usd": 3 },

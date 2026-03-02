@@ -13,6 +13,14 @@ ROLES_DIR="$SWARM_DIR/roles"
 SESSION_NAME="swarm"
 POLL_INTERVAL=3
 STAGE_TIMEOUT=1800  # 30 minutes default
+RESUME_PATH=""
+
+# ─── Error Recovery ──────────────────────────────────────────────────────────
+
+CROSS_STAGE_RETRY_COUNT=0
+MAX_CROSS_STAGE_RETRIES=3
+ACTIVE_FEEDBACK_FILE=""
+RETRY_BACKOFFS=(10 30 60)
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 
@@ -33,6 +41,7 @@ warn() { echo -e "${YELLOW}swarm:${NC} $*"; }
 usage() {
     cat <<'EOF'
 Usage: swarm <repo_path> <ticket> [options]
+       swarm <repo_path> --resume <worktree_path>
 
 Arguments:
   <repo_path>              Path to the git repository
@@ -41,6 +50,7 @@ Arguments:
 Options:
   --github-issue ISSUE     Fetch ticket from GitHub (e.g., owner/repo#42)
   --ticket-file FILE       Read ticket from a file
+  --resume WORKTREE_PATH   Resume a previously interrupted pipeline
   --session NAME           tmux session name (default: swarm)
   --timeout SECONDS        Per-stage timeout in seconds (default: 1800)
   --help                   Show this help
@@ -49,6 +59,7 @@ Examples:
   swarm ~/repos/myapp "add a health check endpoint"
   swarm ~/repos/myapp --github-issue owner/repo#42
   swarm ~/repos/myapp --ticket-file ticket.md
+  swarm ~/repos/myapp --resume ~/repos/myapp-swarm-20250101-120000
 EOF
     exit 0
 }
@@ -96,6 +107,33 @@ get_stage_budget() {
     fi
 }
 
+get_stage_max_retries() {
+    local stage="$1"
+    local override
+    override=$(jq -r --arg s "$stage" '.stage_overrides[$s].max_retries // empty' "$CONFIG")
+    if [[ -n "$override" ]]; then
+        echo "$override"
+    else
+        jq -r '.defaults.max_retries // 3' "$CONFIG"
+    fi
+}
+
+get_retry_backoffs() {
+    local backoffs
+    backoffs=$(jq -r '.defaults.retry_backoffs // empty' "$CONFIG")
+    if [[ -n "$backoffs" ]]; then
+        jq -r '.defaults.retry_backoffs[]' "$CONFIG"
+    else
+        echo "10"
+        echo "30"
+        echo "60"
+    fi
+}
+
+get_max_cross_stage_retries() {
+    jq -r '.defaults.max_cross_stage_retries // 3' "$CONFIG"
+}
+
 # ─── Argument Parsing ────────────────────────────────────────────────────────
 
 parse_args() {
@@ -122,6 +160,11 @@ parse_args() {
                 [[ $# -ge 2 ]] || die "--ticket-file requires an argument"
                 TICKET_SOURCE="file"
                 TICKET_FILE="$2"
+                shift 2
+                ;;
+            --resume)
+                [[ $# -ge 2 ]] || die "--resume requires a worktree path"
+                RESUME_PATH="$2"
                 shift 2
                 ;;
             --session)
@@ -151,6 +194,11 @@ parse_args() {
     # Resolve repo path
     REPO_PATH="$(cd "$REPO_PATH" 2>/dev/null && pwd)" || die "invalid repo path: $REPO_PATH"
     [[ -d "$REPO_PATH/.git" ]] || die "not a git repository: $REPO_PATH"
+
+    # If resuming, skip ticket resolution
+    if [[ -n "$RESUME_PATH" ]]; then
+        return
+    fi
 
     # Resolve ticket content
     case "$TICKET_SOURCE" in
@@ -190,8 +238,10 @@ setup_worktree() {
         --arg ticket "$TICKET" \
         --arg branch "$BRANCH_NAME" \
         --arg worktree "$WORKTREE_PATH" \
+        --arg repo_path "$REPO_PATH" \
+        --arg session_name "$SESSION_NAME" \
         --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{ticket: $ticket, branch: $branch, worktree: $worktree, started: $started, stages: {}}' \
+        '{ticket: $ticket, branch: $branch, worktree: $worktree, repo_path: $repo_path, session_name: $session_name, started: $started, cross_stage_retries: 0, retry_history: [], stages: {}}' \
         > "$SWARM_RUNTIME/run.json"
 
     success "worktree ready: $WORKTREE_PATH"
@@ -345,6 +395,13 @@ build_stage_prompt() {
         *)         die "unknown stage: $stage" ;;
     esac
 
+    # Append retry feedback if present
+    if [[ -n "$ACTIVE_FEEDBACK_FILE" ]] && [[ -f "$ACTIVE_FEEDBACK_FILE" ]]; then
+        echo "" >> "$prompt_file"
+        cat "$ACTIVE_FEEDBACK_FILE" >> "$prompt_file"
+        info "appended retry feedback to ${stage} prompt"
+    fi
+
     echo "$prompt_file"
 }
 
@@ -391,6 +448,62 @@ build_agent_cmd() {
     esac
 }
 
+# ─── Stage Output Validation ─────────────────────────────────────────────────
+
+validate_stage_output() {
+    local stage="$1"
+
+    case "$stage" in
+        reviewer)
+            if [[ ! -s "$SWARM_RUNTIME/review.md" ]]; then
+                warn "validation failed: .swarm/review.md is missing or empty"
+                return 1
+            fi
+            ;;
+        architect)
+            if [[ ! -s "$SWARM_RUNTIME/plan.md" ]]; then
+                warn "validation failed: .swarm/plan.md is missing or empty"
+                return 1
+            fi
+            ;;
+        qa)
+            local pre_sha
+            pre_sha=$(jq -r --arg s "$stage" '.stages[$s].pre_sha // empty' "$SWARM_RUNTIME/run.json")
+            if [[ -n "$pre_sha" ]]; then
+                local changed_files
+                changed_files=$(git -C "$WORKTREE_PATH" diff --name-only "$pre_sha" HEAD 2>/dev/null || true)
+                if [[ -z "$changed_files" ]]; then
+                    warn "validation failed: qa stage produced no file changes"
+                    return 1
+                fi
+            fi
+            ;;
+        coder)
+            local pre_sha
+            pre_sha=$(jq -r --arg s "$stage" '.stages[$s].pre_sha // empty' "$SWARM_RUNTIME/run.json")
+            if [[ -n "$pre_sha" ]]; then
+                local non_test_files
+                non_test_files=$(git -C "$WORKTREE_PATH" diff --name-only "$pre_sha" HEAD 2>/dev/null \
+                    | grep -v -E '(test|spec|_test\.|\.test\.)' || true)
+                if [[ -z "$non_test_files" ]]; then
+                    warn "validation failed: coder stage produced no non-test file changes"
+                    return 1
+                fi
+            fi
+            ;;
+        validator)
+            local pr_count
+            pr_count=$(gh pr list --repo "$REPO_PATH" --head "$BRANCH_NAME" --json number --jq 'length' 2>/dev/null || echo "0")
+            if [[ "$pr_count" -eq 0 ]]; then
+                warn "validation failed: no PR found for branch $BRANCH_NAME"
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
 # ─── Stage Runner ────────────────────────────────────────────────────────────
 
 run_stage() {
@@ -399,6 +512,13 @@ run_stage() {
     local exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
     local start_time elapsed
 
+    # Clean stale exitcode file to support re-runs
+    rm -f "$exitcode_file"
+
+    # Record pre_sha for git-diff-based validation
+    local pre_sha
+    pre_sha=$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null || echo "")
+
     # Build prompt file for this stage
     build_stage_prompt "$stage"
 
@@ -406,11 +526,11 @@ run_stage() {
     local cmd
     cmd=$(build_agent_cmd "$stage")
 
-    # Update run metadata
+    # Update run metadata with pre_sha
     local tmp
     tmp=$(mktemp)
-    jq --arg s "$stage" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '.stages[$s] = {status: "running", started: $t}' \
+    jq --arg s "$stage" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sha "$pre_sha" \
+        '.stages[$s] = {status: "running", started: $t, pre_sha: $sha}' \
         "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
     info "starting stage: ${stage}"
@@ -425,19 +545,36 @@ run_stage() {
             local exit_code
             exit_code=$(cat "$exitcode_file")
 
-            # Update run metadata
-            tmp=$(mktemp)
-            jq --arg s "$stage" --arg c "$exit_code" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                '.stages[$s].status = (if $c == "0" then "done" else "failed" end) | .stages[$s].exit_code = ($c | tonumber) | .stages[$s].finished = $t' \
-                "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
-
             if [[ "$exit_code" == "0" ]]; then
-                # Update pane header
+                # Validate stage output before marking done
+                if ! validate_stage_output "$stage"; then
+                    tmp=$(mktemp)
+                    jq --arg s "$stage" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        '.stages[$s].status = "validation_failed" | .stages[$s].finished = $t | .stages[$s].exit_code = 0' \
+                        "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+                    "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+                        "echo '═══ ${stage^^} ═══ [VALIDATION FAILED]'" Enter
+                    return 1
+                fi
+
+                # Update run metadata
+                tmp=$(mktemp)
+                jq --arg s "$stage" --arg c "$exit_code" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    '.stages[$s].status = "done" | .stages[$s].exit_code = ($c | tonumber) | .stages[$s].finished = $t' \
+                    "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
                 "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
                     "echo '═══ ${stage^^} ═══ [DONE]'" Enter
                 success "stage ${stage} completed successfully"
                 return 0
             else
+                # Update run metadata for failure
+                tmp=$(mktemp)
+                jq --arg s "$stage" --arg c "$exit_code" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    '.stages[$s].status = "failed" | .stages[$s].exit_code = ($c | tonumber) | .stages[$s].finished = $t' \
+                    "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
                 "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
                     "echo '═══ ${stage^^} ═══ [FAILED] (exit code: ${exit_code})'" Enter
                 warn "stage ${stage} failed with exit code ${exit_code}"
@@ -464,6 +601,317 @@ run_stage() {
     done
 }
 
+# ─── Checkpoint & Resume ─────────────────────────────────────────────────────
+
+restore_from_checkpoint() {
+    local worktree_path="$1"
+
+    worktree_path="$(cd "$worktree_path" 2>/dev/null && pwd)" || die "invalid worktree path: $worktree_path"
+
+    SWARM_RUNTIME="$worktree_path/.swarm"
+    [[ -f "$SWARM_RUNTIME/run.json" ]] || die "no run.json found in $SWARM_RUNTIME"
+
+    # Restore state from run.json
+    TICKET=$(jq -r '.ticket // empty' "$SWARM_RUNTIME/run.json")
+    BRANCH_NAME=$(jq -r '.branch // empty' "$SWARM_RUNTIME/run.json")
+    WORKTREE_PATH=$(jq -r '.worktree // empty' "$SWARM_RUNTIME/run.json")
+    REPO_PATH=$(jq -r '.repo_path // empty' "$SWARM_RUNTIME/run.json")
+
+    local saved_session
+    saved_session=$(jq -r '.session_name // empty' "$SWARM_RUNTIME/run.json")
+    if [[ -n "$saved_session" ]]; then
+        SESSION_NAME="$saved_session"
+    fi
+
+    # Restore cross-stage retry count
+    CROSS_STAGE_RETRY_COUNT=$(jq -r '.cross_stage_retries // 0' "$SWARM_RUNTIME/run.json")
+
+    [[ -n "$TICKET" ]] || die "run.json missing ticket"
+    [[ -n "$BRANCH_NAME" ]] || die "run.json missing branch"
+    [[ -n "$WORKTREE_PATH" ]] || die "run.json missing worktree"
+
+    # Remove interrupted marker
+    local tmp
+    tmp=$(mktemp)
+    jq 'del(.interrupted)' "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+    info "restored checkpoint from: $WORKTREE_PATH"
+    info "branch: $BRANCH_NAME"
+    info "ticket: $(echo "$TICKET" | head -c 80)..."
+}
+
+setup_tmux_for_resume() {
+    local stages
+    mapfile -t stages < <(get_pipeline)
+    local expected_panes=${#stages[@]}
+
+    # Check if existing session has the right number of panes
+    local existing_panes=0
+    if "$TMUX" has-session -t "$SESSION_NAME" 2>/dev/null; then
+        existing_panes=$("$TMUX" list-panes -t "${SESSION_NAME}:0" -F '#{pane_index}' 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    if [[ "$existing_panes" -eq "$expected_panes" ]]; then
+        info "reusing existing tmux session '$SESSION_NAME' with $existing_panes panes"
+        PANE_COUNT=$existing_panes
+    else
+        info "recreating tmux session for resume"
+        setup_tmux
+    fi
+}
+
+run_pipeline_resume() {
+    local stages
+    mapfile -t stages < <(get_pipeline)
+
+    info "resuming pipeline: ${stages[*]}"
+    info "ticket: $(echo "$TICKET" | head -c 80)..."
+
+    local i=0
+    while [[ $i -lt ${#stages[@]} ]]; do
+        local stage="${stages[$i]}"
+
+        # Check if stage was already completed
+        local stage_status
+        stage_status=$(jq -r --arg s "$stage" '.stages[$s].status // "pending"' "$SWARM_RUNTIME/run.json")
+
+        if [[ "$stage_status" == "done" ]]; then
+            info "skipping completed stage: ${stage}"
+            "$TMUX" send-keys -t "${SESSION_NAME}:0.${i}" \
+                "echo '═══ ${stage^^} ═══ [DONE] (resumed)'" Enter
+            i=$((i + 1))
+            continue
+        fi
+
+        info "resuming from stage: ${stage}"
+
+        if ! run_stage_with_retries "$stage" "$i"; then
+            echo
+            warn "pipeline halted at stage: ${stage}"
+            warn "worktree preserved at: $WORKTREE_PATH"
+            warn "logs: $SWARM_RUNTIME/log/"
+            warn "resume with: swarm $(printf '%q' "$REPO_PATH") --resume $(printf '%q' "$WORKTREE_PATH")"
+            warn "attach: tmux attach -t $SESSION_NAME"
+            exit 1
+        fi
+
+        # Check for verdict.json (cross-stage retry)
+        local retry_target
+        retry_target=$(check_verdict "$stage" "${stages[@]}")
+        if [[ -n "$retry_target" ]]; then
+            # Find the index of the retry target stage
+            local j
+            for ((j = 0; j < ${#stages[@]}; j++)); do
+                if [[ "${stages[$j]}" == "$retry_target" ]]; then
+                    i=$j
+                    break
+                fi
+            done
+            continue
+        fi
+
+        i=$((i + 1))
+    done
+
+    echo
+    success "pipeline completed successfully!"
+    success "worktree: $WORKTREE_PATH"
+    success "branch: $BRANCH_NAME"
+    info "attach to review: tmux attach -t $SESSION_NAME"
+}
+
+# ─── Transient Retries ───────────────────────────────────────────────────────
+
+run_stage_with_retries() {
+    local stage="$1"
+    local pane_index="$2"
+    local max_retries
+    max_retries=$(get_stage_max_retries "$stage")
+
+    # Load backoff values from config
+    local backoffs
+    mapfile -t backoffs < <(get_retry_backoffs)
+
+    local attempt=0
+    while true; do
+        attempt=$((attempt + 1))
+
+        if run_stage "$stage" "$pane_index"; then
+            return 0
+        fi
+
+        # Check if we've exhausted retries
+        if [[ $attempt -ge $max_retries ]]; then
+            warn "stage ${stage} failed after ${attempt} attempt(s) — no retries left"
+            return 1
+        fi
+
+        # Archive the failed log
+        local log_file="$SWARM_RUNTIME/log/${stage}.log"
+        if [[ -f "$log_file" ]]; then
+            cp "$log_file" "$SWARM_RUNTIME/log/${stage}.attempt${attempt}.log"
+        fi
+
+        # Get backoff duration (clamp to array bounds)
+        local backoff_index=$((attempt - 1))
+        if [[ $backoff_index -ge ${#backoffs[@]} ]]; then
+            backoff_index=$(( ${#backoffs[@]} - 1 ))
+        fi
+        local backoff="${backoffs[$backoff_index]}"
+
+        # Update run.json with retry status
+        local tmp
+        tmp=$(mktemp)
+        jq --arg s "$stage" --argjson r "$attempt" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.stages[$s].status = "retrying" | .stages[$s].retries = $r | .stages[$s].last_retry = $t' \
+            "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+        # Show countdown in tmux pane
+        warn "stage ${stage} failed (attempt ${attempt}/${max_retries}) — retrying in ${backoff}s"
+        "$TMUX" send-keys -t "${SESSION_NAME}:0.${pane_index}" \
+            "echo '═══ ${stage^^} ═══ [RETRY ${attempt}/${max_retries}] waiting ${backoff}s...'" Enter
+
+        sleep "$backoff"
+    done
+}
+
+# ─── Cross-Stage Retry (verdict.json) ────────────────────────────────────────
+
+build_retry_feedback_section() {
+    local retry_from="$1"
+    local reason="$2"
+    local feedback="$3"
+    local loop_num="$4"
+
+    local feedback_file="$SWARM_RUNTIME/prompts/retry_feedback_${loop_num}.md"
+
+    {
+        echo "# Retry Feedback (Loop ${loop_num})"
+        echo ""
+        echo "A previous pipeline run identified issues that require rework."
+        echo ""
+        echo "## Reason"
+        echo ""
+        echo "$reason"
+        echo ""
+        echo "## Detailed Feedback"
+        echo ""
+        echo "$feedback"
+        echo ""
+
+        # Include tail of the stage log that triggered the retry
+        local prev_log="$SWARM_RUNTIME/log/validator.log"
+        if [[ -f "$prev_log" ]]; then
+            echo "## Relevant Log Tail"
+            echo ""
+            echo '```'
+            tail -50 "$prev_log" 2>/dev/null || true
+            echo '```'
+        fi
+    } > "$feedback_file"
+
+    echo "$feedback_file"
+}
+
+# check_verdict — reads verdict.json after a successful stage
+# Prints the retry_from stage name if a retry is needed, empty otherwise.
+# Also sets ACTIVE_FEEDBACK_FILE as a side effect.
+check_verdict() {
+    local current_stage="$1"
+    shift
+    local stages=("$@")
+
+    local verdict_file="$SWARM_RUNTIME/verdict.json"
+
+    if [[ ! -f "$verdict_file" ]]; then
+        return 0
+    fi
+
+    # Read verdict fields
+    local retry_from reason feedback
+    retry_from=$(jq -r '.retry_from // empty' "$verdict_file")
+    reason=$(jq -r '.reason // "no reason given"' "$verdict_file")
+    feedback=$(jq -r '.feedback // ""' "$verdict_file")
+
+    if [[ -z "$retry_from" ]]; then
+        rm -f "$verdict_file"
+        return 0
+    fi
+
+    # Validate retry_from is a known stage
+    local valid=false
+    local target_idx=-1
+    local current_idx=-1
+    for ((k = 0; k < ${#stages[@]}; k++)); do
+        if [[ "${stages[$k]}" == "$retry_from" ]]; then
+            valid=true
+            target_idx=$k
+        fi
+        if [[ "${stages[$k]}" == "$current_stage" ]]; then
+            current_idx=$k
+        fi
+    done
+
+    if [[ "$valid" != "true" ]]; then
+        warn "verdict.json: invalid retry_from stage '${retry_from}' — ignoring"
+        rm -f "$verdict_file"
+        return 0
+    fi
+
+    # Prevent forward retries
+    if [[ $target_idx -gt $current_idx ]]; then
+        warn "verdict.json: cannot retry forward to '${retry_from}' from '${current_stage}' — ignoring"
+        rm -f "$verdict_file"
+        return 0
+    fi
+
+    # Load max from config
+    local max_loops
+    max_loops=$(get_max_cross_stage_retries)
+
+    # Check retry limit
+    if [[ $CROSS_STAGE_RETRY_COUNT -ge $max_loops ]]; then
+        warn "verdict.json: max cross-stage retries ($max_loops) reached — ignoring verdict"
+        rm -f "$verdict_file"
+        return 0
+    fi
+
+    CROSS_STAGE_RETRY_COUNT=$((CROSS_STAGE_RETRY_COUNT + 1))
+    info "cross-stage retry ${CROSS_STAGE_RETRY_COUNT}/${max_loops}: looping back to '${retry_from}' — ${reason}"
+
+    # Archive verdict
+    cp "$verdict_file" "$SWARM_RUNTIME/log/verdict.${CROSS_STAGE_RETRY_COUNT}.json"
+    rm -f "$verdict_file"
+
+    # Update run.json
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson c "$CROSS_STAGE_RETRY_COUNT" \
+        --arg from "$retry_from" --arg r "$reason" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.cross_stage_retries = $c | .retry_history += [{ loop: $c, retry_from: $from, reason: $r, timestamp: $t }]' \
+        "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+
+    # Archive logs for stages that will be re-run
+    for ((k = target_idx; k <= current_idx; k++)); do
+        local s="${stages[$k]}"
+        local log="$SWARM_RUNTIME/log/${s}.log"
+        if [[ -f "$log" ]]; then
+            cp "$log" "$SWARM_RUNTIME/log/${s}.pre_retry_${CROSS_STAGE_RETRY_COUNT}.log"
+        fi
+        # Reset exitcode so stage can re-run
+        rm -f "$SWARM_RUNTIME/log/${s}.exitcode"
+        # Reset stage status in run.json
+        tmp=$(mktemp)
+        jq --arg s "$s" '.stages[$s].status = "pending"' \
+            "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
+    done
+
+    # Build feedback file for the retried stage
+    ACTIVE_FEEDBACK_FILE=$(build_retry_feedback_section "$retry_from" "$reason" "$feedback" "$CROSS_STAGE_RETRY_COUNT")
+
+    echo "$retry_from"
+}
+
 # ─── Pipeline Loop ───────────────────────────────────────────────────────────
 
 run_pipeline() {
@@ -473,17 +921,42 @@ run_pipeline() {
     info "pipeline: ${stages[*]}"
     info "ticket: $(echo "$TICKET" | head -c 80)..."
 
-    for ((i = 0; i < ${#stages[@]}; i++)); do
+    local i=0
+    while [[ $i -lt ${#stages[@]} ]]; do
         local stage="${stages[$i]}"
 
-        if ! run_stage "$stage" "$i"; then
+        # Remove stale verdict.json at top of each iteration
+        rm -f "$SWARM_RUNTIME/verdict.json"
+
+        if ! run_stage_with_retries "$stage" "$i"; then
             echo
             warn "pipeline halted at stage: ${stage}"
             warn "worktree preserved at: $WORKTREE_PATH"
             warn "logs: $SWARM_RUNTIME/log/"
+            warn "resume with: swarm $(printf '%q' "$REPO_PATH") --resume $(printf '%q' "$WORKTREE_PATH")"
             warn "attach: tmux attach -t $SESSION_NAME"
             exit 1
         fi
+
+        # Check for verdict.json (cross-stage retry)
+        local retry_target
+        retry_target=$(check_verdict "$stage" "${stages[@]}")
+        if [[ -n "$retry_target" ]]; then
+            # Find the index of the retry target stage
+            local j
+            for ((j = 0; j < ${#stages[@]}; j++)); do
+                if [[ "${stages[$j]}" == "$retry_target" ]]; then
+                    i=$j
+                    break
+                fi
+            done
+            continue
+        fi
+
+        # Clear feedback file after stage consumes it
+        ACTIVE_FEEDBACK_FILE=""
+
+        i=$((i + 1))
     done
 
     echo
@@ -497,7 +970,7 @@ run_pipeline() {
 
 cleanup() {
     # On interrupt, update run metadata but preserve worktree
-    if [[ -f "$SWARM_RUNTIME/run.json" ]]; then
+    if [[ -n "${SWARM_RUNTIME:-}" ]] && [[ -f "$SWARM_RUNTIME/run.json" ]]; then
         local tmp
         tmp=$(mktemp)
         jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -505,6 +978,9 @@ cleanup() {
             "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
     fi
     warn "interrupted — worktree preserved at: ${WORKTREE_PATH:-unknown}"
+    if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -n "${REPO_PATH:-}" ]]; then
+        warn "resume with: swarm $(printf '%q' "$REPO_PATH") --resume $(printf '%q' "$WORKTREE_PATH")"
+    fi
     exit 130
 }
 
@@ -513,12 +989,18 @@ cleanup() {
 main() {
     check_prerequisites
     parse_args "$@"
-    setup_worktree
-    setup_tmux
 
     trap cleanup INT TERM
 
-    run_pipeline
+    if [[ -n "$RESUME_PATH" ]]; then
+        restore_from_checkpoint "$RESUME_PATH"
+        setup_tmux_for_resume
+        run_pipeline_resume
+    else
+        setup_worktree
+        setup_tmux
+        run_pipeline
+    fi
 }
 
 main "$@"
