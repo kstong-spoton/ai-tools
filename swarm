@@ -85,6 +85,30 @@ check_prerequisites() {
     fi
 }
 
+# ─── Auth Pre-flight ─────────────────────────────────────────────────────────
+
+AUTH_PROVIDER=""
+
+check_auth() {
+    info "checking claude authentication..."
+
+    local auth_json
+    auth_json=$("$CLAUDE" auth status --json 2>&1) || {
+        die "failed to check auth status — run: claude auth login"
+    }
+
+    local logged_in api_provider
+    logged_in=$(echo "$auth_json" | jq -r '.loggedIn // false')
+    api_provider=$(echo "$auth_json" | jq -r '.apiProvider // "unknown"')
+
+    if [[ "$logged_in" != "true" ]]; then
+        die "claude not authenticated — run: claude auth login"
+    fi
+
+    AUTH_PROVIDER="$api_provider"
+    success "authenticated via ${api_provider}"
+}
+
 # ─── Config Helpers ──────────────────────────────────────────────────────────
 
 get_pipeline() {
@@ -449,11 +473,32 @@ build_stage_prompt() {
     echo "$prompt_file"
 }
 
+# ─── Auth Environment ─────────────────────────────────────────────────────────
+
+AUTH_ENV_VARS=(
+    "AWS_PROFILE" "AWS_REGION" "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY"
+    "AWS_SESSION_TOKEN" "CLAUDE_CODE_USE_BEDROCK" "ANTHROPIC_API_KEY"
+    "ANTHROPIC_MODEL" "ANTHROPIC_SMALL_FAST_MODEL"
+)
+
+build_auth_env_prefix() {
+    local env_prefix="env CLAUDECODE="  # Unset CLAUDECODE
+
+    local var
+    for var in "${AUTH_ENV_VARS[@]}"; do
+        if [[ -n "${!var:-}" ]]; then
+            env_prefix+=" ${var}=$(printf '%q' "${!var}")"
+        fi
+    done
+
+    echo "$env_prefix"
+}
+
 # ─── Agent Dispatch ──────────────────────────────────────────────────────────
 
 build_claude_cmd() {
     local stage="$1"
-    local model budget prompt_file system_prompt log_file exitcode_file stage_upper
+    local model budget prompt_file system_prompt log_file exitcode_file stage_upper env_prefix
 
     model=$(get_stage_model "$stage")
     budget=$(get_stage_budget "$stage")
@@ -462,12 +507,13 @@ build_claude_cmd() {
     log_file="$SWARM_RUNTIME/log/${stage}.log"
     exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
     stage_upper=$(uppercase "$stage")
+    env_prefix=$(build_auth_env_prefix)
 
     # Build the command that runs in the tmux pane
     cat <<EOF
 echo '═══ ${stage_upper} ═══ [RUNNING]' && \\
 cd ${WORKTREE_PATH} && \\
-${CLAUDE} -p \\
+${env_prefix} ${CLAUDE} -p \\
   --model ${model} \\
   --max-budget-usd ${budget} \\
   --dangerously-skip-permissions \\
@@ -475,7 +521,7 @@ ${CLAUDE} -p \\
   --system-prompt "\$(cat ${system_prompt})" \\
   "\$(cat ${prompt_file})" \\
   2>&1 | tee ${log_file}; \\
-echo \${PIPESTATUS[0]} > ${exitcode_file}
+echo \${PIPESTATUS[0]:-\${pipestatus[1]}} > ${exitcode_file}
 EOF
 }
 
@@ -591,7 +637,12 @@ run_stage() {
     while true; do
         if [[ -f "$exitcode_file" ]]; then
             local exit_code
-            exit_code=$(cat "$exitcode_file")
+            exit_code=$(cat "$exitcode_file" | tr -d '[:space:]')
+
+            # Guard against empty exit code (e.g. shell compatibility issues)
+            if [[ -z "$exit_code" ]]; then
+                exit_code=1
+            fi
 
             if [[ "$exit_code" == "0" ]]; then
                 # Validate stage output before marking done
@@ -775,6 +826,28 @@ run_pipeline_resume() {
     info "attach to review: tmux attach -t $SESSION_NAME"
 }
 
+# ─── Auth Failure Detection ──────────────────────────────────────────────────
+
+AUTH_FAILURE_PATTERNS=(
+    "Authentication failed" "Invalid API key" "Unauthorized" "401" "403"
+    "ExpiredToken" "ExpiredTokenException" "InvalidAccessKeyId" "AccessDenied"
+    "cannot be launched inside another Claude Code session"
+)
+
+is_auth_failure() {
+    local log_file="$1"
+    [[ -f "$log_file" ]] || return 1
+
+    local pattern
+    for pattern in "${AUTH_FAILURE_PATTERNS[@]}"; do
+        if grep -qi "$pattern" "$log_file" 2>/dev/null; then
+            echo "$pattern"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ─── Transient Retries ───────────────────────────────────────────────────────
 
 run_stage_with_retries() {
@@ -799,6 +872,14 @@ run_stage_with_retries() {
             return 0
         fi
 
+        # Check for auth failure — do not retry
+        local log_file="$SWARM_RUNTIME/log/${stage}.log"
+        local auth_match
+        if auth_match=$(is_auth_failure "$log_file"); then
+            warn "auth failure detected (${auth_match}) — not retrying"
+            return 1
+        fi
+
         # Check if we've exhausted retries
         if [[ $attempt -ge $max_retries ]]; then
             warn "stage ${stage} failed after ${attempt} attempt(s) — no retries left"
@@ -806,7 +887,6 @@ run_stage_with_retries() {
         fi
 
         # Archive the failed log
-        local log_file="$SWARM_RUNTIME/log/${stage}.log"
         if [[ -f "$log_file" ]]; then
             cp "$log_file" "$SWARM_RUNTIME/log/${stage}.attempt${attempt}.log"
         fi
@@ -1044,7 +1124,8 @@ open_tmux_viewer() {
     case "$terminal" in
         ghostty)
             # Use Ghostty CLI to open new window with tmux attach
-            open -na Ghostty.app --args -e "$attach_cmd"
+            # Each arg must be passed separately — Ghostty's -e doesn't accept a single string
+            open -na Ghostty.app --args -e "$TMUX_BIN" attach -t "$SESSION_NAME"
             info "opened Ghostty window with tmux viewer"
             ;;
         iterm)
@@ -1099,6 +1180,7 @@ cleanup() {
 
 main() {
     check_prerequisites
+    check_auth
     parse_args "$@"
 
     trap cleanup INT TERM
