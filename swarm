@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Orchestrates multi-agent coding pipeline through tmux to implement tickets from planning to PR
 set -euo pipefail
 
 # ─── Swarm: Pipeline Orchestrator for Coding Agents ─────────────────────────
