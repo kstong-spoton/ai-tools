@@ -12,7 +12,7 @@ CONFIG="$SWARM_DIR/swarm.json"
 ROLES_DIR="$SWARM_DIR/roles"
 SESSION_NAME="swarm"
 PANE_BASE_INDEX=0  # Will be detected from tmux config
-POLL_INTERVAL=3
+POLL_INTERVAL=3  # Seconds between status checks for stage completion
 STAGE_TIMEOUT=1800  # 30 minutes default
 RESUME_PATH=""
 
