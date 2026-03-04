@@ -38,8 +38,17 @@ Swarm coordinates a sequential pipeline of AI agents, each with a specialized ro
 ## Installation
 
 ```bash
+# Clone the repository
 git clone https://github.com/SpotOnInc/swarm.git
 cd swarm
+
+# Add to PATH (symlink to ~/.local/bin)
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/swarm" ~/.local/bin/swarm
+
+# Ensure ~/.local/bin is in your PATH (add to ~/.zshrc or ~/.bashrc)
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
 Ensure `claude` is authenticated:
@@ -52,23 +61,27 @@ claude auth login
 ### Basic
 
 ```bash
-./swarm --repo <path> --ticket "<description>"
+swarm --repo <path> --ticket "<description>"
 ```
 
 ### Examples
 
 ```bash
 # Inline ticket description
-./swarm --repo ../myapp --ticket "add a health check endpoint"
+swarm --repo ~/projects/myapp --ticket "add a health check endpoint"
 
 # GitHub issue URL
-./swarm --repo ../myapp --ticket https://github.com/owner/repo/issues/42
+swarm --repo ~/projects/myapp --ticket https://github.com/owner/repo/issues/42
 
 # GitHub issue reference
-./swarm --repo ../myapp --ticket owner/repo#42
+swarm --repo ~/projects/myapp --ticket owner/repo#42
 
 # Ticket from file
-./swarm --repo ../myapp --ticket ./ticket.md
+swarm --repo ~/projects/myapp --ticket ./ticket.md
+
+# From within the repo directory
+cd ~/projects/myapp
+swarm --repo . --ticket "fix login bug"
 ```
 
 ### Options
@@ -86,7 +99,7 @@ claude auth login
 If a pipeline is interrupted, resume from where it left off:
 
 ```bash
-./swarm --repo ../myapp --resume ../myapp-swarm-20250101-120000
+swarm --repo ~/projects/myapp --resume ~/projects/myapp-swarm-20250101-120000
 ```
 
 ## How It Works
