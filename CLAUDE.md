@@ -1,0 +1,96 @@
+# CLAUDE.md — ai-tools (Swarm Pipeline Orchestrator)
+
+## Project Overview
+
+Swarm is a bash-based multi-agent pipeline orchestrator that runs specialized Claude Code agents through tmux panes to implement tickets end-to-end. Each run creates an isolated git worktree and passes context between stages via files in `.swarm/`.
+
+**Key files:**
+- `swarm` — Main orchestrator script (bash)
+- `swarm.json` — Pipeline config (stage order, model/budget defaults and overrides)
+- `roles/*.md` — System prompts for each pipeline stage (reviewer, architect, qa, coder, validator)
+- `jira-integration.md` — Planned but unimplemented Jira integration spec
+
+**Pipeline:** reviewer → architect → qa → coder → validator (sequential, each in its own tmux pane)
+
+**Dependencies:** bash, tmux, jq, claude CLI, gh CLI, git
+
+## Workflow Orchestration
+
+### 1. Plan Mode Default
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something goes sideways, STOP and re-plan immediately — don't keep pushing
+- Use plan mode for verification steps, not just building
+- Write detailed specs upfront to reduce ambiguity
+
+### 2. Subagent Strategy
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, throw more compute at it via subagents
+- One task per subagent for focused execution
+
+### 3. Self-Improvement Loop
+- After ANY correction from the user: update `tasks/lessons.md` with the pattern
+- Write rules for yourself that prevent the same mistake
+- Ruthlessly iterate on these lessons until mistake rate drops
+- Review lessons at session start for relevant project
+
+### 4. Verification Before Done
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this?"
+- Run tests, check logs, demonstrate correctness
+
+### 5. Demand Elegance (Balanced)
+- For non-trivial changes: pause and ask "is there a more elegant way?"
+- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
+- Skip this for simple, obvious fixes — don't over-engineer
+- Challenge your own work before presenting it
+
+### 6. Autonomous Bug Fixing
+- When given a bug report: just fix it. Don't ask for hand-holding
+- Point at logs, errors, failing tests — then resolve them
+- Zero context switching required from the user
+- Go fix failing CI tests without being told how
+
+## Task Management
+
+1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
+2. **Verify Plan**: Check in before starting implementation
+3. **Track Progress**: Mark items complete as you go
+4. **Explain Changes**: High-level summary at each step
+5. **Document Results**: Add review section to `tasks/todo.md`
+6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+
+## Core Principles
+
+- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
+- **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
+- **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+## Project-Specific Guidelines
+
+### Bash Standards
+- All scripts use `set -euo pipefail`
+- Use the existing helper functions (`die`, `info`, `success`, `warn`) for output
+- Hardcoded paths for `TMUX` and `CLAUDE` are intentional (homebrew on macOS)
+- Quote all variable expansions; use `[[ ]]` for conditionals
+
+### Adding Pipeline Stages
+- Add a new `.md` file in `roles/` with the system prompt
+- Add a `build_prompt_<stage>()` function in `swarm`
+- Register the stage name in `swarm.json` pipeline array
+- Add the case in `build_stage_prompt()`
+
+### Adding Agent Types
+- Extend `build_agent_cmd()` with a new case
+- Follow the pattern established by `build_claude_cmd()`
+
+### Inter-Agent Communication
+- Agents communicate via files in `.swarm/` (review.md, plan.md, run.json)
+- Never pass state through environment variables or tmux
+- Each stage's prompt is built by reading the previous stage's output files
+
+### Config Convention
+- `swarm.json` controls pipeline order and per-stage model/budget
+- Defaults apply unless overridden in `stage_overrides`
+- Keep budget defaults conservative; coder gets the highest budget
