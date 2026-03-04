@@ -973,6 +973,9 @@ run_pipeline_resume() {
 
 # ─── Auth Failure Detection ──────────────────────────────────────────────────
 
+# Patterns for detecting authentication/authorization failures in agent logs.
+# These errors are non-retryable and will halt the pipeline immediately.
+# Matched case-insensitively by is_auth_failure() to prevent futile retries.
 AUTH_FAILURE_PATTERNS=(
     "Authentication failed" "Invalid API key" "Unauthorized" "401" "403"
     "ExpiredToken" "ExpiredTokenException" "InvalidAccessKeyId" "AccessDenied"
