@@ -733,7 +733,8 @@ validate_stage_output() {
             ;;
         validator)
             local pr_count
-            pr_count=$(gh pr list --repo "$REPO_PATH" --head "$BRANCH_NAME" --json number --jq 'length' 2>/dev/null || echo "0")
+            # Run gh from worktree so it infers repo from git remote (--repo expects OWNER/REPO, not a path)
+            pr_count=$(cd "$WORKTREE_PATH" && gh pr list --head "$BRANCH_NAME" --json number --jq 'length' 2>/dev/null || echo "0")
             if [[ "$pr_count" -eq 0 ]]; then
                 warn "validation failed: no PR found for branch $BRANCH_NAME"
                 return 1
