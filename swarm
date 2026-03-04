@@ -13,7 +13,10 @@ ROLES_DIR="$SWARM_DIR/roles"
 SESSION_NAME="swarm"
 PANE_BASE_INDEX=0  # Will be detected from tmux config
 POLL_INTERVAL=3
-STAGE_TIMEOUT=1800  # 30 minutes default
+# Maximum execution time allowed for each pipeline stage (reviewer, architect, qa, coder, validator).
+# Default: 1800 seconds (30 minutes). Override with --timeout SECONDS command-line flag.
+# When exceeded, the stage is marked as TIMEOUT and the pipeline stops for that stage.
+STAGE_TIMEOUT=1800
 RESUME_PATH=""
 
 # ─── Layout State ─────────────────────────────────────────────────────────────
