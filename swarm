@@ -127,30 +127,13 @@ swap_to_main() {
     incoming=$(get_stage_pane "$stage")
     [[ -z "$incoming" ]] && return 0
 
-    local outgoing="$MAIN_PANE_ID"
-    local old_stage="$MAIN_PANE_STAGE"
+    "$TMUX_BIN" swap-pane -s "$incoming" -t "$MAIN_PANE_ID" 2>/dev/null || return 0
 
-    "$TMUX_BIN" swap-pane -s "$incoming" -t "$outgoing" 2>/dev/null || return 0
-
-    # Update mappings: pane contents swapped, so swap the pane IDs for each stage
-    set_stage_pane "$stage" "$outgoing"
-    if [[ -n "$old_stage" ]]; then
-        set_stage_pane "$old_stage" "$incoming"
-        # Re-apply the old stage's border to its new pane location
-        # Get its status from run.json
-        local old_status="DONE"  # Default to DONE since it completed
-        if [[ -f "$SWARM_RUNTIME/run.json" ]]; then
-            old_status=$(jq -r --arg s "$old_stage" '.stages[$s].status // "done"' "$SWARM_RUNTIME/run.json")
-            case "$old_status" in
-                done)              old_status="DONE" ;;
-                failed)            old_status="FAILED" ;;
-                timeout)           old_status="TIMEOUT" ;;
-                validation_failed) old_status="VALIDATION_FAILED" ;;
-                *)                 old_status="DONE" ;;
-            esac
-        fi
-        update_pane_border "$old_stage" "$old_status"
-    fi
+    # swap-pane swaps POSITIONS, not contents. Pane IDs follow their shells.
+    # After swap: $incoming is now in the main (big) position.
+    # Stage->pane mappings stay unchanged (each stage keeps its original pane ID).
+    # Only update which pane ID is currently in the main position.
+    MAIN_PANE_ID="$incoming"
     MAIN_PANE_STAGE="$stage"
 }
 
