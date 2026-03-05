@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─── Swarm Dashboard: Live Pipeline Status Sidebar ──────────────────────────
+# Standalone script that renders a live-updating dashboard by polling run.json
+# and events.log. Designed to run in a tmux sidebar pane.
+
+RUNTIME=""
+CONFIG=""
+POLL_INTERVAL=2
+
+# ─── ANSI Colors ─────────────────────────────────────────────────────────────
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_GREEN='\033[0;32m'
+C_CYAN='\033[0;36m'
+C_RED='\033[0;31m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_WHITE='\033[1;37m'
+C_GRAY='\033[0;90m'
+
+# ─── Argument Parsing ────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --runtime) RUNTIME="$2"; shift 2 ;;
+        --config)  CONFIG="$2";  shift 2 ;;
+        *)         shift ;;
+    esac
+done
+
+[[ -n "$RUNTIME" ]] || { echo "error: --runtime required"; exit 1; }
+[[ -n "$CONFIG" ]]  || { echo "error: --config required"; exit 1; }
+
+RUN_JSON="$RUNTIME/run.json"
+EVENTS_LOG="$RUNTIME/events.log"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+get_terminal_height() {
+    tput lines 2>/dev/null || echo 40
+}
+
+get_terminal_width() {
+    tput cols 2>/dev/null || echo 50
+}
+
+format_elapsed() {
+    local seconds="$1"
+    if [[ $seconds -lt 60 ]]; then
+        printf "%ds" "$seconds"
+    elif [[ $seconds -lt 3600 ]]; then
+        printf "%dm %02ds" $((seconds / 60)) $((seconds % 60))
+    else
+        printf "%dh %02dm" $((seconds / 3600)) $(((seconds % 3600) / 60))
+    fi
+}
+
+human_size() {
+    local bytes="$1"
+    if [[ $bytes -lt 1024 ]]; then
+        printf "%dB" "$bytes"
+    else
+        local kb=$(( (bytes * 10) / 1024 ))
+        printf "%d.%dK" $((kb / 10)) $((kb % 10))
+    fi
+}
+
+# ─── Status Indicators ───────────────────────────────────────────────────────
+
+status_indicator() {
+    local status="$1"
+    case "$status" in
+        done)              printf "${C_GREEN}[x]${C_RESET}" ;;
+        running)           printf "${C_CYAN}[>]${C_RESET}" ;;
+        pending)           printf "${C_GRAY}[ ]${C_RESET}" ;;
+        failed)            printf "${C_RED}[!]${C_RESET}" ;;
+        timeout)           printf "${C_RED}[!]${C_RESET}" ;;
+        validation_failed) printf "${C_YELLOW}[!]${C_RESET}" ;;
+        retrying)          printf "${C_YELLOW}[R]${C_RESET}" ;;
+        *)                 printf "${C_GRAY}[ ]${C_RESET}" ;;
+    esac
+}
+
+status_color() {
+    local status="$1"
+    case "$status" in
+        done)              echo "$C_GREEN" ;;
+        running)           echo "$C_CYAN" ;;
+        failed|timeout)    echo "$C_RED" ;;
+        validation_failed) echo "$C_YELLOW" ;;
+        retrying)          echo "$C_YELLOW" ;;
+        *)                 echo "$C_GRAY" ;;
+    esac
+}
+
+# ─── Render ───────────────────────────────────────────────────────────────────
+
+render() {
+    local width height
+    width=$(get_terminal_width)
+    height=$(get_terminal_height)
+
+    # Read run.json once per render cycle
+    local json=""
+    if [[ -f "$RUN_JSON" ]]; then
+        json=$(cat "$RUN_JSON" 2>/dev/null || true)
+    fi
+    [[ -n "$json" ]] || return 0
+
+    # Read pipeline stages from config
+    local stages=()
+    while IFS= read -r line; do stages+=("$line"); done < <(jq -r '.pipeline[]' "$CONFIG" 2>/dev/null)
+
+    local branch started
+    branch=$(echo "$json" | jq -r '.branch // "unknown"')
+    started=$(echo "$json" | jq -r '.started // empty')
+
+    # Compute total elapsed
+    local elapsed_str="--"
+    if [[ -n "$started" ]]; then
+        local start_epoch now_epoch
+        start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$started" "+%s" 2>/dev/null || echo 0)
+        now_epoch=$(date +%s)
+        if [[ $start_epoch -gt 0 ]]; then
+            elapsed_str=$(format_elapsed $((now_epoch - start_epoch)))
+        fi
+    fi
+
+    local separator
+    separator=$(printf '%*s' "$((width - 2))" '' | tr ' ' '-')
+
+    # Clear screen
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+
+    local lines_used=0
+
+    # Header
+    printf "${C_BOLD}${C_WHITE}  SWARM PIPELINE${C_RESET}\n"
+    printf "  ${C_DIM}Branch:${C_RESET}  %s\n" "$branch"
+    printf "  ${C_DIM}Elapsed:${C_RESET} %s\n" "$elapsed_str"
+    printf "  %s\n" "$separator"
+    lines_used=4
+
+    # Pipeline stages
+    printf "  ${C_BOLD}PIPELINE${C_RESET}\n"
+    lines_used=$((lines_used + 1))
+
+    for stage in "${stages[@]}"; do
+        local st elapsed_info=""
+        st=$(echo "$json" | jq -r --arg s "$stage" '.stages[$s].status // "pending"')
+
+        # Compute stage elapsed time
+        local s_started s_finished
+        s_started=$(echo "$json" | jq -r --arg s "$stage" '.stages[$s].started // empty')
+        s_finished=$(echo "$json" | jq -r --arg s "$stage" '.stages[$s].finished // empty')
+
+        if [[ -n "$s_started" ]]; then
+            local s_start_epoch
+            s_start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$s_started" "+%s" 2>/dev/null || echo 0)
+            if [[ $s_start_epoch -gt 0 ]]; then
+                if [[ -n "$s_finished" ]]; then
+                    local s_end_epoch
+                    s_end_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$s_finished" "+%s" 2>/dev/null || echo 0)
+                    if [[ $s_end_epoch -gt 0 ]]; then
+                        elapsed_info=$(format_elapsed $((s_end_epoch - s_start_epoch)))
+                    fi
+                elif [[ "$st" == "running" ]]; then
+                    local now_epoch
+                    now_epoch=$(date +%s)
+                    elapsed_info="$(format_elapsed $((now_epoch - s_start_epoch)))..."
+                fi
+            fi
+        fi
+
+        local color
+        color=$(status_color "$st")
+        local indicator
+        indicator=$(status_indicator "$st")
+
+        # Retry info
+        local retry_info=""
+        local retries
+        retries=$(echo "$json" | jq -r --arg s "$stage" '.stages[$s].retries // empty')
+        if [[ -n "$retries" ]] && [[ "$retries" != "0" ]]; then
+            retry_info=" (retry $retries)"
+        fi
+
+        if [[ -n "$elapsed_info" ]]; then
+            printf "    %b ${color}%-14s${C_RESET} %s%s\n" "$indicator" "$stage" "$elapsed_info" "$retry_info"
+        else
+            printf "    %b ${color}%-14s${C_RESET}%s\n" "$indicator" "$stage" "$retry_info"
+        fi
+        lines_used=$((lines_used + 1))
+    done
+
+    printf "  %s\n" "$separator"
+    lines_used=$((lines_used + 1))
+
+    # Artifacts section
+    printf "  ${C_BOLD}ARTIFACTS${C_RESET}\n"
+    lines_used=$((lines_used + 1))
+
+    local has_artifacts=false
+    for artifact in review.md plan.md; do
+        local path="$RUNTIME/$artifact"
+        if [[ -f "$path" ]]; then
+            local size
+            size=$(wc -c < "$path" 2>/dev/null | tr -d ' ')
+            printf "    %-20s %s\n" "$artifact" "$(human_size "$size")"
+            lines_used=$((lines_used + 1))
+            has_artifacts=true
+        fi
+    done
+
+    # Check for git diff stats (if coder or later ran)
+    local coder_status
+    coder_status=$(echo "$json" | jq -r '.stages.coder.status // "pending"')
+    if [[ "$coder_status" == "done" ]] || [[ "$coder_status" == "running" ]]; then
+        local worktree
+        worktree=$(echo "$json" | jq -r '.worktree // empty')
+        if [[ -n "$worktree" ]] && [[ -d "$worktree" ]]; then
+            local diff_stat
+            diff_stat=$(git -C "$worktree" diff --stat HEAD~1 2>/dev/null | tail -1 || true)
+            if [[ -n "$diff_stat" ]]; then
+                printf "    ${C_DIM}%s${C_RESET}\n" "$diff_stat"
+                lines_used=$((lines_used + 1))
+                has_artifacts=true
+            fi
+        fi
+    fi
+
+    # Check for PR URL
+    local validator_status
+    validator_status=$(echo "$json" | jq -r '.stages.validator.status // "pending"')
+    if [[ "$validator_status" == "done" ]]; then
+        local worktree branch_name
+        worktree=$(echo "$json" | jq -r '.worktree // empty')
+        branch_name=$(echo "$json" | jq -r '.branch // empty')
+        if [[ -n "$worktree" ]] && [[ -n "$branch_name" ]]; then
+            local pr_url
+            pr_url=$(cd "$worktree" && gh pr list --head "$branch_name" --json url --jq '.[0].url' 2>/dev/null || true)
+            if [[ -n "$pr_url" ]]; then
+                printf "    ${C_GREEN}PR: %s${C_RESET}\n" "$pr_url"
+                lines_used=$((lines_used + 1))
+                has_artifacts=true
+            fi
+        fi
+    fi
+
+    if [[ "$has_artifacts" == "false" ]]; then
+        printf "    ${C_DIM}(none yet)${C_RESET}\n"
+        lines_used=$((lines_used + 1))
+    fi
+
+    printf "  %s\n" "$separator"
+    lines_used=$((lines_used + 1))
+
+    # Activity log section
+    printf "  ${C_BOLD}ACTIVITY${C_RESET}\n"
+    lines_used=$((lines_used + 1))
+
+    # Compute remaining lines for activity log (reserve 3 for footer)
+    local remaining=$((height - lines_used - 3))
+    if [[ $remaining -lt 2 ]]; then
+        remaining=2
+    fi
+
+    if [[ -f "$EVENTS_LOG" ]] && [[ -s "$EVENTS_LOG" ]]; then
+        tail -n "$remaining" "$EVENTS_LOG" 2>/dev/null | while IFS= read -r line; do
+            # Truncate to fit width
+            if [[ ${#line} -gt $((width - 4)) ]]; then
+                line="${line:0:$((width - 7))}..."
+            fi
+            printf "    ${C_DIM}%s${C_RESET}\n" "$line"
+        done
+    else
+        printf "    ${C_DIM}(waiting for events)${C_RESET}\n"
+    fi
+
+    # Footer
+    printf "\n  %s\n" "$separator"
+    local cross_retries
+    cross_retries=$(echo "$json" | jq -r '.cross_stage_retries // 0')
+    local max_cross
+    max_cross=$(jq -r '.defaults.max_cross_stage_retries // 3' "$CONFIG" 2>/dev/null || echo 3)
+    printf "  ${C_DIM}Retries: %s/%s${C_RESET}\n" "$cross_retries" "$max_cross"
+}
+
+# ─── Signal Handling ──────────────────────────────────────────────────────────
+
+handle_exit() {
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    exit 0
+}
+
+trap handle_exit SIGTERM SIGINT
+trap render WINCH
+
+# ─── Main Loop ────────────────────────────────────────────────────────────────
+
+# Wait for run.json to appear
+while [[ ! -f "$RUN_JSON" ]]; do
+    sleep 1
+done
+
+while true; do
+    render
+    sleep "$POLL_INTERVAL"
+done

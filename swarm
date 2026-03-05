@@ -17,11 +17,9 @@ STAGE_TIMEOUT=1800  # 30 minutes default
 RESUME_PATH=""
 
 # ─── Layout State ─────────────────────────────────────────────────────────────
-# Parallel arrays for stage -> pane ID mapping (bash 3.x compatible)
-STAGE_NAMES=()    # Stage names
-STAGE_PANES=()    # Corresponding pane IDs
-MAIN_PANE_STAGE=""            # Stage currently in main pane
-MAIN_PANE_ID=""               # Pane ID of the large left pane
+MAIN_PANE_ID=""               # Pane ID of the single stage pane
+DASHBOARD_PANE_ID=""          # Pane ID of the dashboard sidebar
+EVENTS_LOG=""                 # Path to events.log (set during worktree setup)
 
 # ─── Error Recovery ──────────────────────────────────────────────────────────
 
@@ -72,39 +70,9 @@ get_status_fg() {
 
 # ─── Pane Border Helpers ──────────────────────────────────────────────────────
 
-# Set stage -> pane ID mapping
-set_stage_pane() {
-    local stage="$1" pane_id="$2"
-    local i
-    for ((i = 0; i < ${#STAGE_NAMES[@]}; i++)); do
-        if [[ "${STAGE_NAMES[$i]}" == "$stage" ]]; then
-            STAGE_PANES[$i]="$pane_id"
-            return 0
-        fi
-    done
-    # Not found, add new entry
-    STAGE_NAMES+=("$stage")
-    STAGE_PANES+=("$pane_id")
-}
-
-# Get pane ID for stage
-get_stage_pane() {
-    local stage="$1"
-    local i
-    for ((i = 0; i < ${#STAGE_NAMES[@]}; i++)); do
-        if [[ "${STAGE_NAMES[$i]}" == "$stage" ]]; then
-            echo "${STAGE_PANES[$i]}"
-            return 0
-        fi
-    done
-    echo ""
-}
-
 update_pane_border() {
     local stage="$1" status="$2" extra="${3:-}"
-    local pane_id
-    pane_id=$(get_stage_pane "$stage")
-    [[ -n "$pane_id" ]] || return 0
+    [[ -n "$MAIN_PANE_ID" ]] || return 0
 
     local bg fg stage_upper
     bg=$(get_status_bg "$status")
@@ -115,26 +83,115 @@ update_pane_border() {
     [[ -n "$extra" ]] && label="[$status] $extra"
 
     local format="#[fg=${fg},bg=${bg},bold] ${stage_upper} ${label} #[default]"
-    "$TMUX_BIN" select-pane -t "$pane_id" -T "$format" 2>/dev/null || true
+    "$TMUX_BIN" select-pane -t "$MAIN_PANE_ID" -T "$format" 2>/dev/null || true
 }
 
-swap_to_main() {
+# ─── Event Logging ────────────────────────────────────────────────────────────
+
+log_event() {
+    local type="$1" message="$2"
+    [[ -n "${EVENTS_LOG:-}" ]] || return 0
+    local ts
+    ts=$(date +%H:%M)
+    echo "${ts} [${type}] ${message}" >> "$EVENTS_LOG"
+}
+
+# ─── Stage Banners ────────────────────────────────────────────────────────────
+
+compute_stage_elapsed() {
     local stage="$1"
-    [[ "$stage" == "$MAIN_PANE_STAGE" ]] && return 0
-    [[ -z "$MAIN_PANE_ID" ]] && return 0
+    local s_started s_finished
+    s_started=$(jq -r --arg s "$stage" '.stages[$s].started // empty' "$SWARM_RUNTIME/run.json")
+    s_finished=$(jq -r --arg s "$stage" '.stages[$s].finished // empty' "$SWARM_RUNTIME/run.json")
 
-    local incoming
-    incoming=$(get_stage_pane "$stage")
-    [[ -z "$incoming" ]] && return 0
+    if [[ -z "$s_started" ]] || [[ -z "$s_finished" ]]; then
+        echo ""
+        return
+    fi
 
-    "$TMUX_BIN" swap-pane -s "$incoming" -t "$MAIN_PANE_ID" 2>/dev/null || return 0
+    local start_epoch end_epoch
+    start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$s_started" "+%s" 2>/dev/null || echo 0)
+    end_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$s_finished" "+%s" 2>/dev/null || echo 0)
 
-    # swap-pane swaps POSITIONS, not contents. Pane IDs follow their shells.
-    # After swap: $incoming is now in the main (big) position.
-    # Stage->pane mappings stay unchanged (each stage keeps its original pane ID).
-    # Only update which pane ID is currently in the main position.
-    MAIN_PANE_ID="$incoming"
-    MAIN_PANE_STAGE="$stage"
+    if [[ $start_epoch -eq 0 ]] || [[ $end_epoch -eq 0 ]]; then
+        echo ""
+        return
+    fi
+
+    local diff=$((end_epoch - start_epoch))
+    printf "%dm %02ds" $((diff / 60)) $((diff % 60))
+}
+
+get_artifact_summary() {
+    local stage="$1"
+    local parts=()
+
+    case "$stage" in
+        reviewer)
+            if [[ -f "$SWARM_RUNTIME/review.md" ]]; then
+                local size
+                size=$(wc -c < "$SWARM_RUNTIME/review.md" | tr -d ' ')
+                parts+=("review.md ${size}B")
+            fi
+            ;;
+        architect)
+            if [[ -f "$SWARM_RUNTIME/plan.md" ]]; then
+                local size
+                size=$(wc -c < "$SWARM_RUNTIME/plan.md" | tr -d ' ')
+                parts+=("plan.md ${size}B")
+            fi
+            ;;
+        coder|qa)
+            local diff_stat
+            diff_stat=$(git -C "$WORKTREE_PATH" diff --shortstat HEAD~1 2>/dev/null || true)
+            if [[ -n "$diff_stat" ]]; then
+                parts+=("${diff_stat## }")
+            fi
+            ;;
+        validator)
+            local pr_url
+            pr_url=$(cd "$WORKTREE_PATH" && gh pr list --head "$BRANCH_NAME" --json url --jq '.[0].url' 2>/dev/null || true)
+            if [[ -n "$pr_url" ]]; then
+                parts+=("PR: $pr_url")
+            fi
+            ;;
+    esac
+
+    if [[ ${#parts[@]} -gt 0 ]]; then
+        local IFS=", "
+        echo "${parts[*]}"
+    fi
+}
+
+print_stage_banner() {
+    local stage="$1" index="$2" total="$3" prev_stage="${4:-}"
+    local pane_id="$MAIN_PANE_ID"
+
+    local banner=""
+    banner+="\n"
+    banner+="══════════════════════════════════════════════════════════════════\n"
+    banner+="  STAGE $((index + 1))/${total}: $(echo "$stage" | tr '[:lower:]' '[:upper:]')\n"
+
+    # Previous stage result
+    if [[ -n "$prev_stage" ]]; then
+        local prev_status prev_elapsed artifact_summary
+        prev_status=$(jq -r --arg s "$prev_stage" '.stages[$s].status // "unknown"' "$SWARM_RUNTIME/run.json")
+        prev_elapsed=$(compute_stage_elapsed "$prev_stage")
+        artifact_summary=$(get_artifact_summary "$prev_stage")
+
+        if [[ -n "$prev_elapsed" ]]; then
+            banner+="  Previous: ${prev_stage} -> ${prev_status} (${prev_elapsed})\n"
+        fi
+        if [[ -n "$artifact_summary" ]]; then
+            banner+="  Artifacts: ${artifact_summary}\n"
+        fi
+    fi
+
+    banner+="══════════════════════════════════════════════════════════════════\n"
+    banner+="\n"
+
+    "$TMUX_BIN" send-keys -t "$pane_id" "printf '${banner}'" Enter
+    sleep 0.3
 }
 
 usage() {
@@ -370,6 +427,8 @@ setup_worktree() {
     WORKTREE_PATH="$(cd "$WORKTREE_PATH" && pwd)"
     SWARM_RUNTIME="$WORKTREE_PATH/.swarm"
     mkdir -p "$SWARM_RUNTIME/prompts" "$SWARM_RUNTIME/log"
+    EVENTS_LOG="$SWARM_RUNTIME/events.log"
+    touch "$EVENTS_LOG"
 
     # Write run metadata
     jq -n \
@@ -420,66 +479,32 @@ create_tmux_session() {
     info "tmux session '$SESSION_NAME' created"
 }
 
-# Create the main + sidebar layout (call after viewer attaches)
-setup_tmux_layout() {
-    local stages
-    stages=()
-    while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
-
-    # Reset stage mappings
-    STAGE_NAMES=()
-    STAGE_PANES=()
-
-    # Get the initial pane ID (this becomes the main pane, ~70% width)
+# Create the 2-pane dashboard layout (call after viewer attaches)
+setup_dashboard_layout() {
+    # Get the initial pane ID (this becomes the main pane, ~75% width)
     MAIN_PANE_ID=$("$TMUX_BIN" list-panes -t "${SESSION_NAME}:main" -F '#{pane_id}' | head -1)
 
-    # First stage goes in main pane
-    MAIN_PANE_STAGE="${stages[0]}"
-    set_stage_pane "${stages[0]}" "$MAIN_PANE_ID"
+    # Create dashboard sidebar pane (~25% width) via horizontal split
+    "$TMUX_BIN" split-window -t "$MAIN_PANE_ID" -h -p 25
+    DASHBOARD_PANE_ID=$("$TMUX_BIN" display -t "${SESSION_NAME}:main" -p '#{pane_id}')
 
-    # Create sidebar pane (~30% width) via horizontal split
-    # split-window focuses the new pane, so we can get its ID with display
-    "$TMUX_BIN" split-window -t "$MAIN_PANE_ID" -h -p 30
-    local sidebar_pane_id
-    sidebar_pane_id=$("$TMUX_BIN" display -t "${SESSION_NAME}:main" -p '#{pane_id}')
+    # Set border labels
+    local dashboard_format="#[fg=colour231,bg=colour240,bold] DASHBOARD #[default]"
+    "$TMUX_BIN" select-pane -t "$DASHBOARD_PANE_ID" -T "$dashboard_format" 2>/dev/null || true
 
-    # Second stage goes in first sidebar slot
-    if [[ ${#stages[@]} -ge 2 ]]; then
-        set_stage_pane "${stages[1]}" "$sidebar_pane_id"
-    fi
-
-    # Split sidebar vertically for remaining stages (3, 4, 5...)
-    # Use calculated percentages for even distribution
-    local num_sidebar=$((${#stages[@]} - 1))  # stages in sidebar
-    local split_target="$sidebar_pane_id"
-    for ((i = 2; i < ${#stages[@]}; i++)); do
-        # Calculate percentage: (remaining-1)/remaining to give to new pane
-        local remaining=$((num_sidebar - (i - 2)))
-        local pct=$(( (remaining - 1) * 100 / remaining ))
-        "$TMUX_BIN" split-window -t "$split_target" -v -p "$pct"
-        local new_pane_id
-        # split-window focuses the new pane, get its ID
-        new_pane_id=$("$TMUX_BIN" display -t "${SESSION_NAME}:main" -p '#{pane_id}')
-        set_stage_pane "${stages[$i]}" "$new_pane_id"
-        split_target="$new_pane_id"
-    done
-
-    # Initialize all pane borders with PENDING status
-    for stage in "${stages[@]}"; do
-        update_pane_border "$stage" "PENDING"
-    done
+    # Set initial PENDING border on main pane
+    local pending_format="#[fg=colour250,bg=colour240,bold] PIPELINE [PENDING] #[default]"
+    "$TMUX_BIN" select-pane -t "$MAIN_PANE_ID" -T "$pending_format" 2>/dev/null || true
 
     # Focus on main pane
     "$TMUX_BIN" select-pane -t "$MAIN_PANE_ID"
 
-    PANE_COUNT=${#stages[@]}
-    info "layout created with $PANE_COUNT panes (main + sidebar)"
+    info "layout created with 2 panes (main + dashboard)"
 }
 
-# Legacy wrapper for compatibility
-setup_tmux() {
-    create_tmux_session
-    setup_tmux_layout
+start_dashboard() {
+    local cmd="${SWARM_DIR}/swarm-dashboard --runtime ${SWARM_RUNTIME} --config ${CONFIG}"
+    "$TMUX_BIN" send-keys -t "$DASHBOARD_PANE_ID" "$cmd" Enter
 }
 
 # ─── Prompt Builders ─────────────────────────────────────────────────────────
@@ -733,15 +758,9 @@ validate_stage_output() {
 run_stage() {
     local stage="$1"
     local stage_index="$2"
-    local pane_id
-    pane_id=$(get_stage_pane "$stage")
+    local pane_id="$MAIN_PANE_ID"
     local exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
     local start_time elapsed
-
-    # Swap this stage into the main pane
-    swap_to_main "$stage"
-    # Re-fetch pane_id after swap (may have changed)
-    pane_id=$(get_stage_pane "$stage")
 
     # Clean stale exitcode file to support re-runs
     rm -f "$exitcode_file"
@@ -769,6 +788,17 @@ run_stage() {
 
     info "starting stage: ${stage}"
 
+    # Print stage banner and log event
+    local stages_list=()
+    while IFS= read -r line; do stages_list+=("$line"); done < <(get_pipeline)
+    local total=${#stages_list[@]}
+    local prev_stage=""
+    if [[ $stage_index -gt 0 ]]; then
+        prev_stage="${stages_list[$((stage_index - 1))]}"
+    fi
+    print_stage_banner "$stage" "$stage_index" "$total" "$prev_stage"
+    log_event "STAGE_START" "${stage} started"
+
     # Send command to the pane
     "$TMUX_BIN" send-keys -t "$pane_id" "$cmd" Enter
 
@@ -793,6 +823,7 @@ run_stage() {
                         "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
                     update_pane_border "$stage" "VALIDATION_FAILED"
+                    log_event "VALIDATION_FAILED" "${stage} output validation failed"
                     return 1
                 fi
 
@@ -803,6 +834,7 @@ run_stage() {
                     "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
                 update_pane_border "$stage" "DONE"
+                log_event "STAGE_DONE" "${stage} completed"
                 success "stage ${stage} completed successfully"
                 return 0
             else
@@ -813,6 +845,7 @@ run_stage() {
                     "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
                 update_pane_border "$stage" "FAILED" "(exit ${exit_code})"
+                log_event "STAGE_FAILED" "${stage} failed (exit ${exit_code})"
                 warn "stage ${stage} failed with exit code ${exit_code}"
                 return 1
             fi
@@ -828,6 +861,7 @@ run_stage() {
                 '.stages[$s].status = "timeout" | .stages[$s].finished = $t' \
                 "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
 
+            log_event "STAGE_TIMEOUT" "${stage} timed out after ${STAGE_TIMEOUT}s"
             warn "stage ${stage} timed out after ${STAGE_TIMEOUT}s"
             return 1
         fi
@@ -858,6 +892,10 @@ restore_from_checkpoint() {
         SESSION_NAME="$saved_session"
     fi
 
+    # Initialize events log
+    EVENTS_LOG="$SWARM_RUNTIME/events.log"
+    touch "$EVENTS_LOG"
+
     # Restore cross-stage retry count
     CROSS_STAGE_RETRY_COUNT=$(jq -r '.cross_stage_retries // 0' "$SWARM_RUNTIME/run.json")
 
@@ -875,31 +913,12 @@ restore_from_checkpoint() {
     info "ticket: $(echo "$TICKET" | head -c 80)..."
 }
 
-restore_border_colors() {
-    local stages
-    stages=()
-    while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
-
-    # Restore border colors from run.json stage statuses
-    for stage in "${stages[@]}"; do
-        local status
-        status=$(jq -r --arg s "$stage" '.stages[$s].status // "pending"' "$SWARM_RUNTIME/run.json")
-        case "$status" in
-            done)              update_pane_border "$stage" "DONE" ;;
-            failed)            update_pane_border "$stage" "FAILED" ;;
-            timeout)           update_pane_border "$stage" "TIMEOUT" ;;
-            validation_failed) update_pane_border "$stage" "VALIDATION_FAILED" ;;
-            running)           update_pane_border "$stage" "PENDING" ;;  # Reset running to pending
-            *)                 update_pane_border "$stage" "PENDING" ;;
-        esac
-    done
-}
-
 run_pipeline_resume() {
     local stages
     stages=()
     while IFS= read -r line; do stages+=("$line"); done < <(get_pipeline)
 
+    log_event "RESUMED" "pipeline resumed"
     info "resuming pipeline: ${stages[*]}"
     info "ticket: $(echo "$TICKET" | head -c 80)..."
 
@@ -913,7 +932,7 @@ run_pipeline_resume() {
 
         if [[ "$stage_status" == "done" ]]; then
             info "skipping completed stage: ${stage}"
-            # Border already set by setup_tmux_for_resume
+            # Dashboard shows completed status
             i=$((i + 1))
             continue
         fi
@@ -949,6 +968,7 @@ run_pipeline_resume() {
     done
 
     echo
+    log_event "PIPELINE_DONE" "resumed pipeline completed"
     success "pipeline completed successfully!"
     success "worktree: $WORKTREE_PATH"
     success "branch: $BRANCH_NAME"
@@ -1034,6 +1054,7 @@ run_stage_with_retries() {
         # Show retry status in pane border
         warn "stage ${stage} failed (attempt ${attempt}/${max_retries}) — retrying in ${backoff}s"
         update_pane_border "$stage" "RETRY" "${attempt}/${max_retries}"
+        log_event "RETRY" "${stage} retry ${attempt}/${max_retries} (backoff ${backoff}s)"
 
         sleep "$backoff"
     done
@@ -1141,6 +1162,7 @@ check_verdict() {
     fi
 
     CROSS_STAGE_RETRY_COUNT=$((CROSS_STAGE_RETRY_COUNT + 1))
+    log_event "CROSS_RETRY" "loop ${CROSS_STAGE_RETRY_COUNT}/${max_loops}: back to ${retry_from}"
     info "cross-stage retry ${CROSS_STAGE_RETRY_COUNT}/${max_loops}: looping back to '${retry_from}' — ${reason}"
 
     # Archive verdict
@@ -1225,6 +1247,7 @@ run_pipeline() {
     done
 
     echo
+    log_event "PIPELINE_DONE" "all stages completed"
     success "pipeline completed successfully!"
     success "worktree: $WORKTREE_PATH"
     success "branch: $BRANCH_NAME"
@@ -1294,6 +1317,7 @@ cleanup() {
             '.interrupted = $t' \
             "$SWARM_RUNTIME/run.json" > "$tmp" && mv "$tmp" "$SWARM_RUNTIME/run.json"
     fi
+    log_event "INTERRUPTED" "pipeline interrupted"
     warn "interrupted — worktree preserved at: ${WORKTREE_PATH:-unknown}"
     if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -n "${REPO_PATH:-}" ]]; then
         warn "resume with: swarm $(printf '%q' "$REPO_PATH") --resume $(printf '%q' "$WORKTREE_PATH")"
@@ -1315,15 +1339,16 @@ main() {
         create_tmux_session
         open_tmux_viewer
         sleep 1  # Wait for viewer to attach and resize session
-        setup_tmux_layout
-        restore_border_colors
+        setup_dashboard_layout
+        start_dashboard
         run_pipeline_resume
     else
         setup_worktree
         create_tmux_session
         open_tmux_viewer
         sleep 1  # Wait for viewer to attach and resize session
-        setup_tmux_layout
+        setup_dashboard_layout
+        start_dashboard
         run_pipeline
     fi
 }
