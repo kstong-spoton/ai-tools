@@ -229,13 +229,26 @@ check_prerequisites() {
     local missing=()
     [[ -x "$TMUX_BIN" ]] || missing+=(tmux)
     command -v jq &>/dev/null || missing+=(jq)
-    [[ -x "$CLAUDE" ]] || missing+=(claude)
     command -v gh &>/dev/null || missing+=(gh)
     command -v git &>/dev/null || missing+=(git)
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         die "missing prerequisites: ${missing[*]}"
     fi
+
+    # Validate binaries for all agent types used in the pipeline
+    local -A checked_types=()
+    local stage agent_type binary
+    for stage in $(get_pipeline); do
+        agent_type=$(get_stage_agent_type "$stage")
+        [[ -n "${checked_types[$agent_type]:-}" ]] && continue
+        checked_types["$agent_type"]=1
+
+        binary=$(get_agent_binary "$agent_type")
+        if [[ ! -x "$binary" ]]; then
+            die "agent binary not found or not executable: $binary (agent_type=$agent_type, used by stage=$stage)"
+        fi
+    done
 }
 
 # ─── Auth Pre-flight ─────────────────────────────────────────────────────────
@@ -243,10 +256,27 @@ check_prerequisites() {
 AUTH_PROVIDER=""
 
 check_auth() {
+    # Only check claude auth if at least one stage uses claude
+    local has_claude=false
+    local stage
+    for stage in $(get_pipeline); do
+        if [[ "$(get_stage_agent_type "$stage")" == "claude" ]]; then
+            has_claude=true
+            break
+        fi
+    done
+    if [[ "$has_claude" != "true" ]]; then
+        info "no claude stages in pipeline — skipping auth check"
+        return 0
+    fi
+
     info "checking claude authentication..."
 
+    local claude_bin
+    claude_bin=$(get_agent_binary "claude")
+
     local auth_json
-    auth_json=$("$CLAUDE" auth status --json 2>&1) || {
+    auth_json=$("$claude_bin" auth status --json 2>&1) || {
         die "failed to check auth status — run: claude auth login"
     }
 
@@ -270,13 +300,24 @@ get_pipeline() {
 
 get_stage_model() {
     local stage="$1"
+    # 1. Stage override
     local override
     override=$(jq -r --arg s "$stage" '.stage_overrides[$s].model // empty' "$CONFIG")
     if [[ -n "$override" ]]; then
         echo "$override"
-    else
-        jq -r '.defaults.model' "$CONFIG"
+        return
     fi
+    # 2. Agent-type default model
+    local agent_type
+    agent_type=$(get_stage_agent_type "$stage")
+    local agent_default
+    agent_default=$(jq -r --arg t "$agent_type" '.agents[$t].default_model // empty' "$CONFIG")
+    if [[ -n "$agent_default" ]]; then
+        echo "$agent_default"
+        return
+    fi
+    # 3. Global default
+    jq -r '.defaults.model' "$CONFIG"
 }
 
 get_stage_budget() {
@@ -315,6 +356,32 @@ get_retry_backoffs() {
 
 get_max_cross_stage_retries() {
     jq -r '.defaults.max_cross_stage_retries // 3' "$CONFIG"
+}
+
+get_stage_agent_type() {
+    local stage="$1"
+    local override
+    override=$(jq -r --arg s "$stage" '.stage_overrides[$s].agent_type // empty' "$CONFIG")
+    if [[ -n "$override" ]]; then
+        echo "$override"
+    else
+        jq -r '.defaults.agent_type // "claude"' "$CONFIG"
+    fi
+}
+
+get_agent_binary() {
+    local agent_type="$1"
+    local binary
+    binary=$(jq -r --arg t "$agent_type" '.agents[$t].binary // empty' "$CONFIG")
+    if [[ -n "$binary" ]]; then
+        echo "$binary"
+    else
+        # Fallback to hardcoded paths for known agent types
+        case "$agent_type" in
+            claude) echo "$CLAUDE" ;;
+            *)      die "no binary configured for agent type: $agent_type (add agents.$agent_type.binary to swarm.json)" ;;
+        esac
+    fi
 }
 
 # ─── Argument Parsing ────────────────────────────────────────────────────────
@@ -656,7 +723,7 @@ build_auth_env_prefix() {
 
 build_claude_cmd() {
     local stage="$1"
-    local model budget prompt_file system_prompt log_file exitcode_file env_prefix
+    local model budget prompt_file system_prompt log_file exitcode_file env_prefix claude_bin
 
     model=$(get_stage_model "$stage")
     budget=$(get_stage_budget "$stage")
@@ -665,12 +732,13 @@ build_claude_cmd() {
     log_file="$SWARM_RUNTIME/log/${stage}.log"
     exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
     env_prefix=$(build_auth_env_prefix)
+    claude_bin=$(get_agent_binary "claude")
 
     # Build the command that runs in the tmux pane
     # Status is shown via pane border, not echoed
     cat <<EOF
 cd ${WORKTREE_PATH} && \\
-${env_prefix} ${CLAUDE} -p \\
+${env_prefix} ${claude_bin} -p \\
   --model ${model} \\
   --max-budget-usd ${budget} \\
   --dangerously-skip-permissions \\
@@ -682,16 +750,38 @@ echo \${PIPESTATUS[0]:-\${pipestatus[1]}} > ${exitcode_file}
 EOF
 }
 
+build_codex_cmd() {
+    local stage="$1"
+    local model prompt_file system_prompt log_file exitcode_file codex_bin
+
+    model=$(get_stage_model "$stage")
+    prompt_file="$SWARM_RUNTIME/prompts/${stage}.txt"
+    system_prompt="$ROLES_DIR/${stage}.md"
+    log_file="$SWARM_RUNTIME/log/${stage}.log"
+    exitcode_file="$SWARM_RUNTIME/log/${stage}.exitcode"
+    codex_bin=$(get_agent_binary "codex")
+
+    cat <<EOF
+cd ${WORKTREE_PATH} && \\
+${codex_bin} -q \\
+  --model ${model} \\
+  --full-auto \\
+  -f ${system_prompt} \\
+  "\$(cat ${prompt_file})" \\
+  2>&1 | tee ${log_file}; \\
+echo \${PIPESTATUS[0]:-\${pipestatus[1]}} > ${exitcode_file}
+EOF
+}
+
 # Extensible dispatch — add new agent types here
 build_agent_cmd() {
     local stage="$1"
-    local agent_type="${2:-claude}"
+    local agent_type
+    agent_type=$(get_stage_agent_type "$stage")
 
     case "$agent_type" in
         claude) build_claude_cmd "$stage" ;;
-        # Future agent types:
-        # codex)  build_codex_cmd "$stage" ;;
-        # kimi)   build_kimi_cmd "$stage" ;;
+        codex)  build_codex_cmd "$stage" ;;
         *)      die "unknown agent type: $agent_type" ;;
     esac
 }
