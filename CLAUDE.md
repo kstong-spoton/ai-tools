@@ -2,17 +2,18 @@
 
 ## Project Overview
 
-Swarm is a bash-based multi-agent pipeline orchestrator that runs specialized Claude Code agents through tmux panes to implement tickets end-to-end. Each run creates an isolated git worktree and passes context between stages via files in `.swarm/`.
+Swarm is a bash-based multi-agent pipeline orchestrator that runs specialized AI coding agents through tmux panes to implement tickets end-to-end. Supports multiple agent backends (Claude Code, OpenAI Codex) with per-stage configuration. Each run creates an isolated git worktree and passes context between stages via files in `.swarm/`.
 
 **Key files:**
 - `swarm` — Main orchestrator script (bash)
-- `swarm.json` — Pipeline config (stage order, model/budget defaults and overrides)
+- `swarm-dashboard` — Live pipeline status sidebar script (bash)
+- `swarm.json` — Pipeline config (agent types, models, budgets, stage overrides)
 - `roles/*.md` — System prompts for each pipeline stage (reviewer, architect, qa, coder, validator)
 - `jira-integration.md` — Planned but unimplemented Jira integration spec
 
-**Pipeline:** reviewer → architect → qa → coder → validator (sequential, each in its own tmux pane)
+**Pipeline:** reviewer → architect → qa → coder → validator (sequential, main pane + dashboard sidebar)
 
-**Dependencies:** bash, tmux, jq, claude CLI, gh CLI, git
+**Dependencies:** bash, tmux, jq, gh CLI, git, and at least one agent CLI (claude, codex)
 
 ## Workflow Orchestration
 
@@ -72,7 +73,7 @@ Swarm is a bash-based multi-agent pipeline orchestrator that runs specialized Cl
 ### Bash Standards
 - All scripts use `set -euo pipefail`
 - Use the existing helper functions (`die`, `info`, `success`, `warn`) for output
-- Hardcoded paths for `TMUX` and `CLAUDE` are intentional (homebrew on macOS)
+- `TMUX_BIN` is hardcoded (homebrew on macOS); agent binaries are configured in `swarm.json` `agents` section
 - Quote all variable expansions; use `[[ ]]` for conditionals
 
 ### Adding Pipeline Stages
@@ -82,8 +83,10 @@ Swarm is a bash-based multi-agent pipeline orchestrator that runs specialized Cl
 - Add the case in `build_stage_prompt()`
 
 ### Adding Agent Types
-- Extend `build_agent_cmd()` with a new case
-- Follow the pattern established by `build_claude_cmd()`
+- Add a `build_<type>_cmd()` function in `swarm` (see `build_codex_cmd()` for reference)
+- Add the case in `build_agent_cmd()`
+- Add the agent's binary path to `agents` in `swarm.json`
+- Set `agent_type` on desired stages in `stage_overrides`
 
 ### Inter-Agent Communication
 - Agents communicate via files in `.swarm/` (review.md, plan.md, run.json)
@@ -91,6 +94,9 @@ Swarm is a bash-based multi-agent pipeline orchestrator that runs specialized Cl
 - Each stage's prompt is built by reading the previous stage's output files
 
 ### Config Convention
-- `swarm.json` controls pipeline order and per-stage model/budget
-- Defaults apply unless overridden in `stage_overrides`
+- `swarm.json` controls pipeline order, agent types, models, and budgets
+- `agents` section maps agent type names to binary paths and default models
+- `defaults` apply unless overridden in `stage_overrides`
+- Model resolution: stage override → `agents.<type>.default_model` → `defaults.model`
 - Keep budget defaults conservative; coder gets the highest budget
+- `max_budget_usd` is Claude-specific; codex has no equivalent budget flag
